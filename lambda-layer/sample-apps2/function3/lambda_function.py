@@ -1,0 +1,61 @@
+import json
+import boto3
+import os
+
+
+dynamodb = boto3.resource('dynamodb')
+table_name = 'HistoricalRecordDynamoDBTable'
+table = dynamodb.Table(table_name)
+
+def lambda_handler(event, context):
+
+    query_params = event.get('queryStringParameters', {})
+
+    # 提取 recordId 和 value
+    record_id = query_params.get('recordId')
+    owners = query_params.get('owners')
+    pet_id = query_params.get('petid')
+
+    if owners is None or pet_id is None:
+        raise Exception('Missing owner or pet_idßßßß')
+
+    if record_id is None:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'message': 'recordId is required'}),
+            'headers': {
+                'Content-Type': 'application/json'
+            }
+        }
+
+    try:
+        # Retrieve the item with the specified recordId
+        response = table.get_item(Key={'recordId': record_id})  # Assuming recordId is the primary key
+
+        # Check if the item exists
+        if 'Item' in response:
+            return {
+                'statusCode': 200,
+                'body': json.dumps(response['Item']),
+                'headers': {
+                    'Content-Type': 'application/json'
+                }
+            }
+        else:
+            return {
+                'statusCode': 404,
+                'body': json.dumps({'message': 'Record not found'}),
+                'headers': {
+                    'Content-Type': 'application/json'
+                }
+            }
+
+    except Exception as e:
+        print("Error retrieving record:", str(e))
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'message': 'Internal server error'}),
+            'headers': {
+                'Content-Type': 'application/json'
+            }
+        }
