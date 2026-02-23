@@ -108,6 +108,7 @@ jobs:
         continue-on-error: true
         run: |
           aws s3 mb s3://${{ env.BUCKET_NAME }}
+          aws s3api put-bucket-versioning --bucket ${{ env.BUCKET_NAME }} --versioning-configuration Status=Enabled
           aws s3 cp ${{ env.LAYER_ARTIFACT_NAME }} s3://${{ env.BUCKET_NAME }}
           
           # Sign the layer
@@ -118,13 +119,14 @@ jobs:
           echo "PROFILE is: $PROFILE"
 
           echo "Starting signing job..."
-          # Capture both stdout and stderr to properly handle errors
+          set +e
           SIGNING_OUTPUT=$(aws signer start-signing-job \
             --source "s3={bucketName=${{ env.BUCKET_NAME }},key=${{ env.LAYER_ARTIFACT_NAME }},version=null}" \
             --destination "s3={bucketName=${{ env.BUCKET_NAME }},prefix=signed-}" \
             --profile-name ADOTLambdaLayerSigningProfile \
             --query 'jobId' --output text 2>&1)
           SIGNING_EXIT_CODE=$?
+          set -e
           
           if [ $SIGNING_EXIT_CODE -ne 0 ]; then
             echo "Signing job failed with exit code $SIGNING_EXIT_CODE"
