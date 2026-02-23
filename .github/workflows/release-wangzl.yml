@@ -108,18 +108,18 @@ jobs:
         continue-on-error: true
         run: |
           aws s3 mb s3://${{ env.BUCKET_NAME }}
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          aws s3api put-bucket-policy --bucket ${{ env.BUCKET_NAME }} --policy "{
-            \"Version\": \"2012-10-17\",
-            \"Statement\": [{
-              \"Sid\": \"AllowSignerAccess\",
-              \"Effect\": \"Allow\",
-              \"Principal\": {\"Service\": \"signer.amazonaws.com\"},
-              \"Action\": [\"s3:GetObject\", \"s3:GetObjectVersion\", \"s3:PutObject\"],
-              \"Resource\": \"arn:aws:s3:::${{ env.BUCKET_NAME }}/*\",
-              \"Condition\": {\"StringEquals\": {\"aws:SourceAccount\": \"${ACCOUNT_ID}\"}}
-            }]
-          }"
+          # ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          # aws s3api put-bucket-policy --bucket ${{ env.BUCKET_NAME }} --policy "{
+          #   \"Version\": \"2012-10-17\",
+          #   \"Statement\": [{
+          #     \"Sid\": \"AllowSignerAccess\",
+          #     \"Effect\": \"Allow\",
+          #     \"Principal\": {\"Service\": \"signer.amazonaws.com\"},
+          #     \"Action\": [\"s3:GetObject\", \"s3:GetObjectVersion\", \"s3:PutObject\"],
+          #     \"Resource\": \"arn:aws:s3:::${{ env.BUCKET_NAME }}/*\",
+          #     \"Condition\": {\"StringEquals\": {\"aws:SourceAccount\": \"${ACCOUNT_ID}\"}}
+          #   }]
+          # }"
           aws s3 cp ${{ env.LAYER_ARTIFACT_NAME }} s3://${{ env.BUCKET_NAME }}
           
           # Sign the layer
