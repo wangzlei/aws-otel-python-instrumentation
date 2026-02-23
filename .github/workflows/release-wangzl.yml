@@ -108,7 +108,6 @@ jobs:
         continue-on-error: true
         run: |
           aws s3 mb s3://${{ env.BUCKET_NAME }}
-          aws s3api put-bucket-versioning --bucket ${{ env.BUCKET_NAME }} --versioning-configuration Status=Enabled
           aws s3 cp ${{ env.LAYER_ARTIFACT_NAME }} s3://${{ env.BUCKET_NAME }}
           
           # Sign the layer
