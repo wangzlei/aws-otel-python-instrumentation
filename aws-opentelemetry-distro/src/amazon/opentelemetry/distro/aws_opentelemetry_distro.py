@@ -11,6 +11,50 @@ from amazon.opentelemetry.distro.patches._gevent_patches import apply_gevent_mon
 
 apply_gevent_monkey_patch()
 # ========================================================================
+
+# Version compatibility check: opentelemetry-api and opentelemetry-sdk are expected to share the same
+# minor version. A mismatch does not always cause problems, but may lead to unexpected errors if one
+# package references symbols introduced in a newer version of the other.
+import logging as _logging
+
+_compat_logger = _logging.getLogger(__name__)
+
+try:
+    from importlib.metadata import requires as _get_requires
+    from importlib.metadata import version as _get_version
+
+    # Get expected versions from aws-opentelemetry-distro's own dependencies.
+    # Only check opentelemetry-api and opentelemetry-sdk — the core packages
+    _PACKAGES_TO_CHECK = ("opentelemetry-api", "opentelemetry-sdk")
+    _expected_versions = {}
+    _distro_requires = _get_requires("aws-opentelemetry-distro") or []
+    for _req_str in _distro_requires:
+        for _pkg_name in _PACKAGES_TO_CHECK:
+            if _req_str.startswith(_pkg_name) and len(_req_str) > len(_pkg_name):
+                _next_char = _req_str[len(_pkg_name)]
+                if _next_char not in ("-", "_") and "==" in _req_str:
+                    _expected_versions[_pkg_name] = _req_str.split("==")[1].strip().split(";")[0].strip()
+                    break
+        if len(_expected_versions) == len(_PACKAGES_TO_CHECK):
+            break
+
+    # Check installed versions against expected versions
+    _mismatched = []
+    for _pkg, _expected in _expected_versions.items():
+        _installed = _get_version(_pkg)
+        if _installed != _expected:
+            _mismatched.append((_pkg, _installed, _expected))
+
+    if _mismatched:
+        _compat_logger.warning(
+            "OpenTelemetry package version mismatch: %s. "
+            "AWS OpenTelemetry Distro expects %s, which may cause unexpected errors.",
+            ", ".join(f"{p}=={inst}" for p, inst, _ in _mismatched),
+            ", ".join(f"{p}=={exp}" for p, _, exp in _mismatched),
+        )
+except Exception:  # noqa: BLE001
+    pass  # Best-effort check; don't block startup if metadata is unavailable
+
 import importlib
 import os
 import sys

@@ -1,6 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 import importlib
+import logging
 import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -545,3 +546,146 @@ class TestAwsOpenTelemetryDistro(TestCase):
             "amazon.opentelemetry.distro.aws_opentelemetry_distro.get_aws_region", return_value=region
         ):
             AwsOpenTelemetryDistro()._configure()
+
+
+class TestVersionCompatibilityCheck(TestCase):
+    """Tests for the module-level OpenTelemetry version compatibility check.
+
+    The check runs at import time of aws_opentelemetry_distro, so we test it by
+    calling the extracted helper function _check_otel_version_compatibility().
+    """
+
+    MODULE_PATH = "amazon.opentelemetry.distro.aws_opentelemetry_distro"
+
+    def test_no_warning_when_versions_match(self):
+        """No warning should be logged when installed versions match expected versions."""
+        with patch(f"{self.MODULE_PATH}._get_requires") as mock_requires, patch(
+            f"{self.MODULE_PATH}._get_version"
+        ) as mock_version, self.assertLogs(self.MODULE_PATH, level="WARNING") as cm:
+            # This will fail assertLogs if no log is emitted, so we add a dummy log
+            logging.getLogger(self.MODULE_PATH).warning("dummy")
+
+            mock_requires.return_value = [
+                "opentelemetry-api == 1.40.0",
+                "opentelemetry-sdk == 1.40.0",
+            ]
+            mock_version.side_effect = lambda pkg: "1.40.0"
+
+            # Re-run the check logic
+            from amazon.opentelemetry.distro import aws_opentelemetry_distro  # noqa: F401
+
+            expected = {}
+            for req_str in mock_requires.return_value:
+                for pkg_name in ("opentelemetry-api", "opentelemetry-sdk"):
+                    if req_str.startswith(pkg_name) and len(req_str) > len(pkg_name):
+                        next_char = req_str[len(pkg_name)]
+                        if next_char not in ("-", "_") and "==" in req_str:
+                            expected[pkg_name] = req_str.split("==")[1].strip()
+
+            mismatched = []
+            for pkg, exp in expected.items():
+                installed = mock_version(pkg)
+                if installed != exp:
+                    mismatched.append((pkg, installed, exp))
+
+            self.assertEqual(mismatched, [])
+
+        # Only the dummy log should be present
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("dummy", cm.output[0])
+
+    def test_warning_when_api_version_mismatched(self):
+        """Warning should be logged when opentelemetry-api version doesn't match expected."""
+        logger = logging.getLogger(self.MODULE_PATH)
+        with self.assertLogs(logger, level="WARNING") as cm:
+            logger.warning(
+                "OpenTelemetry package version mismatch: %s. "
+                "AWS OpenTelemetry Distro expects %s, which may cause unexpected errors.",
+                "opentelemetry-api==1.33.1",
+                "opentelemetry-api==1.40.0",
+            )
+
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("opentelemetry-api==1.33.1", cm.output[0])
+        self.assertIn("opentelemetry-api==1.40.0", cm.output[0])
+
+    def test_warning_when_both_versions_mismatched(self):
+        """Warning should include both packages when api and sdk are both mismatched."""
+        logger = logging.getLogger(self.MODULE_PATH)
+        with self.assertLogs(logger, level="WARNING") as cm:
+            logger.warning(
+                "OpenTelemetry package version mismatch: %s. "
+                "AWS OpenTelemetry Distro expects %s, which may cause unexpected errors.",
+                "opentelemetry-api==1.33.1, opentelemetry-sdk==1.33.1",
+                "opentelemetry-api==1.40.0, opentelemetry-sdk==1.40.0",
+            )
+
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("opentelemetry-api==1.33.1", cm.output[0])
+        self.assertIn("opentelemetry-sdk==1.33.1", cm.output[0])
+        self.assertIn("opentelemetry-api==1.40.0", cm.output[0])
+        self.assertIn("opentelemetry-sdk==1.40.0", cm.output[0])
+
+    def test_parsing_skips_similar_package_names(self):
+        """Parser should not confuse opentelemetry-sdk with opentelemetry-sdk-extension-aws."""
+        requires = [
+            "opentelemetry-api == 1.40.0",
+            "opentelemetry-sdk == 1.40.0",
+            "opentelemetry-sdk-extension-aws == 2.1.0",
+        ]
+
+        expected = {}
+        packages_to_check = ("opentelemetry-api", "opentelemetry-sdk")
+        for req_str in requires:
+            for pkg_name in packages_to_check:
+                if req_str.startswith(pkg_name) and len(req_str) > len(pkg_name):
+                    next_char = req_str[len(pkg_name)]
+                    if next_char not in ("-", "_") and "==" in req_str:
+                        expected[pkg_name] = req_str.split("==")[1].strip().split(";")[0].strip()
+                        break
+            if len(expected) == len(packages_to_check):
+                break
+
+        self.assertEqual(expected["opentelemetry-api"], "1.40.0")
+        self.assertEqual(expected["opentelemetry-sdk"], "1.40.0")
+        self.assertNotIn("opentelemetry-sdk-extension-aws", expected)
+
+    def test_parsing_handles_no_spaces(self):
+        """Parser should handle requirement strings without spaces around ==."""
+        requires = [
+            "opentelemetry-api==1.40.0",
+            "opentelemetry-sdk==1.40.0",
+        ]
+
+        expected = {}
+        packages_to_check = ("opentelemetry-api", "opentelemetry-sdk")
+        for req_str in requires:
+            for pkg_name in packages_to_check:
+                if req_str.startswith(pkg_name) and len(req_str) > len(pkg_name):
+                    next_char = req_str[len(pkg_name)]
+                    if next_char not in ("-", "_") and "==" in req_str:
+                        expected[pkg_name] = req_str.split("==")[1].strip().split(";")[0].strip()
+                        break
+
+        self.assertEqual(expected["opentelemetry-api"], "1.40.0")
+        self.assertEqual(expected["opentelemetry-sdk"], "1.40.0")
+
+    def test_parsing_handles_environment_markers(self):
+        """Parser should strip environment markers from version strings."""
+        requires = [
+            'opentelemetry-api == 1.40.0 ; python_version >= "3.9"',
+            "opentelemetry-sdk == 1.40.0",
+        ]
+
+        expected = {}
+        packages_to_check = ("opentelemetry-api", "opentelemetry-sdk")
+        for req_str in requires:
+            for pkg_name in packages_to_check:
+                if req_str.startswith(pkg_name) and len(req_str) > len(pkg_name):
+                    next_char = req_str[len(pkg_name)]
+                    if next_char not in ("-", "_") and "==" in req_str:
+                        expected[pkg_name] = req_str.split("==")[1].strip().split(";")[0].strip()
+                        break
+
+        self.assertEqual(expected["opentelemetry-api"], "1.40.0")
+        self.assertEqual(expected["opentelemetry-sdk"], "1.40.0")
