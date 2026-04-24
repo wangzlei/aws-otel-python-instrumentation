@@ -180,6 +180,10 @@ class AwsOpenTelemetryConfigurator(_OTelSDKConfigurator):
 # Long term, we wish to contribute this to upstream to improve initialization customizability and reduce dependency on
 # internal logic.
 def _initialize_components():
+    if _is_lambda_environment():
+        _initialize_components_lite()
+        return
+
     # Remove 'awsemf' from OTEL_METRICS_EXPORTER if present to prevent validation errors
     # from _import_exporters in OTel dependencies which would try to load exporters
     # We will contribute emf exporter to upstream for supporting OTel metrics in SDK
@@ -225,6 +229,30 @@ def _initialize_components():
     logging_enabled = os.getenv(_OTEL_PYTHON_LOGGING_AUTO_INSTRUMENTATION_ENABLED, "false")
     if logging_enabled.strip().lower() == "true":
         _init_logging(log_exporters, resource)
+
+
+def _initialize_components_lite():
+    """Lambda-optimized initialization using Lite SDK.
+
+    Skips the full OTel SDK (protobuf, requests, BatchSpanProcessor, Resource
+    detection, MeterProvider) and uses a minimal TracerProvider that serializes
+    spans as JSON over UDP to localhost:2000.
+    """
+    from amazon.opentelemetry.distro.lite_sdk import (
+        LiteTracerProvider,
+        SimpleProcessor,
+        XRayUdpSpanExporter,
+    )
+
+    daemon_address = os.environ.get(AWS_XRAY_DAEMON_ADDRESS_CONFIG, "127.0.0.1:2000")
+    host, _, port = daemon_address.rpartition(":")
+    port = int(port) if port else 2000
+    host = host or "127.0.0.1"
+
+    exporter = XRayUdpSpanExporter(host=host, port=port)
+    processor = SimpleProcessor(exporter)
+    provider = LiteTracerProvider(processor)
+    set_tracer_provider(provider)
 
 
 def _init_logging(
