@@ -55,7 +55,7 @@ Replace the full OTel SDK with a **Lite SDK** (~300 lines) when `OTEL_LAMBDA_COL
 
 Results are consistent across memory sizes:
 
-| Memory | Baseline | Lite SDK | Original ADOT | Overhead Reduction |
+| Memory | Baseline | Lite SDK | Original OTel | Overhead Reduction |
 |--------|----------|----------|---------------|--------------------|
 | 256MB | 781ms | 1,007ms (+226ms) | 1,330ms (+549ms) | 59% |
 | 512MB | 762ms | 975ms (+212ms) | 1,394ms (+632ms) | 66% |
