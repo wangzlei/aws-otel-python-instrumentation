@@ -1,0 +1,14 @@
+# Upstream OpenTelemetry Injector source the ADOT build is based on. build.sh downloads and verifies it.
+# To move to a new upstream release: update the tag, tarball and SHA256 here, re-apply patches/ (drop any that
+# upstream has absorbed), and update ZIG_* to the Zig version the release's zig-version file requires.
+UPSTREAM_REPO=https://github.com/open-telemetry/opentelemetry-injector
+UPSTREAM_TAG=v0.11.0
+UPSTREAM_TARBALL=https://github.com/open-telemetry/opentelemetry-injector/archive/refs/tags/v0.11.0.tar.gz
+UPSTREAM_SHA256=dfa298673306891ef4b029f1e7841b425efaf7335f2b46fd1f2d831f6e90ff49
+
+# Zig toolchain required by UPSTREAM_TAG (its zig-version file), per build host architecture.
+ZIG_VERSION=0.15.2
+ZIG_X86_64_LINUX_URL=https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz
+ZIG_X86_64_LINUX_SHA256=02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+ZIG_AARCH64_LINUX_URL=https://ziglang.org/download/0.15.2/zig-aarch64-linux-0.15.2.tar.xz
+ZIG_AARCH64_LINUX_SHA256=958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f

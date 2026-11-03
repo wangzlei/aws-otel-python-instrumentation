@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lei Wang <wangzl@amazon.com>
+Date: Tue, 3 Nov 2026 23:14:36 +0000
+Subject: [PATCH 2/4] python: build PYTHONPATH the way the Kubernetes operators
+ do
+
+Python only runs a sitecustomize.py found at the top level of a
+sys.path entry. Prepend the agent's auto_instrumentation directory
+(which holds sitecustomize.py) and append the agent root (which holds
+the packages sitecustomize.py imports), so the application's own
+PYTHONPATH entries come before the agent's bundled packages:
+
+  <agent>/opentelemetry/instrumentation/auto_instrumentation:<original>:<agent>
+
+This is the PYTHONPATH the OpenTelemetry and CloudWatch operators set
+today, so switching to the injector does not change which copy of a
+library an application imports.
+---
+ src/python.zig | 56 ++++++++++++++++++++++++++++----------------------
+ 1 file changed, 31 insertions(+), 25 deletions(-)
+
+diff --git a/src/python.zig b/src/python.zig
+index 161a516..80d39ef 100644
+--- a/src/python.zig
++++ b/src/python.zig
+@@ -267,38 +267,44 @@ test "determinePythonpathWithLibcSuffix: should return full path for musl" {
+     }
+ }
+ 
++/// Directory (relative to the agent path) that holds the auto-instrumentation sitecustomize.py. Python only runs a
++/// sitecustomize.py found at the top level of a sys.path entry, so this directory goes first, the agent root (with
++/// the SDK packages that sitecustomize.py imports) goes last, after the application's own PYTHONPATH entries. This
++/// matches the PYTHONPATH the CloudWatch / OpenTelemetry operators set today.
++const python_sitecustomize_subdir = "/opentelemetry/instrumentation/auto_instrumentation";
++
+ fn getModifiedPythonpathValue(
+     gpa: std.mem.Allocator,
+     original_value_optional: ?[:0]const u8,
+     python_auto_instrumentation_agent_path: [:0]u8,
+ ) ?[:0]u8 {
++    defer gpa.free(python_auto_instrumentation_agent_path);
+     if (original_value_optional) |original_value| {
+         if (std.mem.indexOf(u8, original_value, python_auto_instrumentation_agent_path)) |_| {
+-            // If the correct path flag is already present in PYTHONPATH, do nothing. This is particularly important
+-            // to avoid double injection, for example if we are injecting into a container which has a shell
+-            // executable as its entry point (into which we inject env var modifications), and then this shell starts
+-            // the Python executable as a child process, which inherits the environment from the already injected
+-            // shell.
+-            gpa.free(python_auto_instrumentation_agent_path);
++            // Already injected, e.g. inherited from a parent process (a shell entry point) we injected into.
+             return null;
+         }
+-
+-        // If PYTHONPATH is already set, prepend the our directory to the original value. Since we copy over
+-        // python_auto_instrumentation_agent_path into newly allocated memory, we can free the parameter here.
+-        defer gpa.free(python_auto_instrumentation_agent_path);
+-        return std.fmt.allocPrintSentinel(
+-            gpa,
+-            "{s}:{s}",
+-            .{ python_auto_instrumentation_agent_path, original_value },
+-            0,
+-        ) catch |err| {
+-            print.printError("Cannot allocate memory to manipulate the value of \"{s}\": {}", .{ pythonpath_env_var_name, err });
+-            return null;
+-        };
++        if (original_value.len > 0) {
++            return std.fmt.allocPrintSentinel(
++                gpa,
++                "{s}" ++ python_sitecustomize_subdir ++ ":{s}:{s}",
++                .{ python_auto_instrumentation_agent_path, original_value, python_auto_instrumentation_agent_path },
++                0,
++            ) catch |err| {
++                print.printError("Cannot allocate memory to manipulate the value of \"{s}\": {}", .{ pythonpath_env_var_name, err });
++                return null;
++            };
++        }
+     }
+-
+-    // If PYTHONPATH is not set, simply return our path, which will then become the only entry in PYTHONPATH.
+-    return python_auto_instrumentation_agent_path[0..];
++    return std.fmt.allocPrintSentinel(
++        gpa,
++        "{s}" ++ python_sitecustomize_subdir ++ ":{s}",
++        .{ python_auto_instrumentation_agent_path, python_auto_instrumentation_agent_path },
++        0,
++    ) catch |err| {
++        print.printError("Cannot allocate memory to manipulate the value of \"{s}\": {}", .{ pythonpath_env_var_name, err });
++        return null;
++    };
+ }
+ 
+ test "getModifiedPythonpathValue: should return the auto-instrumentation directory if original value is unset" {
+@@ -319,12 +325,12 @@ test "getModifiedPythonpathValue: should return the auto-instrumentation directo
+         allocator.free(val);
+     });
+     try testing.expectEqualStrings(
+-        "/usr/lib/opentelemetry/python/glibc",
++        "/usr/lib/opentelemetry/python/glibc/opentelemetry/instrumentation/auto_instrumentation:/usr/lib/opentelemetry/python/glibc",
+         modified_pythonpath_value orelse "-",
+     );
+ }
+ 
+-test "getModifiedPythonpathValue: should prepend the auto-instrumentation directory if original value exists" {
++test "getModifiedPythonpathValue: should put sitecustomize first and the agent root last if original value exists" {
+     const allocator = testing.allocator;
+     const original_value: [:0]const u8 = "/another/path/1:/another/path/2"[0.. :0];
+     const python_auto_instrumentation_agent_path = try std.fmt.allocPrintSentinel(
+@@ -343,7 +349,7 @@ test "getModifiedPythonpathValue: should prepend the auto-instrumentation direct
+         allocator.free(val);
+     });
+     try testing.expectEqualStrings(
+-        "/usr/lib/opentelemetry/python/glibc:/another/path/1:/another/path/2",
++        "/usr/lib/opentelemetry/python/glibc/opentelemetry/instrumentation/auto_instrumentation:/another/path/1:/another/path/2:/usr/lib/opentelemetry/python/glibc",
+         modified_pythonpath_value orelse "-",
+     );
+ }

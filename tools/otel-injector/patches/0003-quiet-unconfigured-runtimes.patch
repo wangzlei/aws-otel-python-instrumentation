@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lei Wang <wangzl@amazon.com>
+Date: Tue, 3 Nov 2026 23:14:36 +0000
+Subject: [PATCH 3/4] Log unconfigured runtimes and missing libc builds at
+ debug level
+
+The injector runs in every process of a container, and most containers
+only use one runtime. Not having an agent path configured for a runtime,
+and an agent prefix that has no build for the detected libc flavour
+(e.g. a musl application with a glibc-only agent), are normal and now
+log at debug level instead of info/error. A configured path that does
+not exist is still logged as an error.
+---
+ src/dotnet.zig | 20 +++++++++++++++++++-
+ src/jvm.zig    |  8 +++++++-
+ src/nodejs.zig |  8 +++++++-
+ src/python.zig | 34 +++++++++++++++++++++++++++++++++-
+ src/ruby.zig   | 17 ++++++++++++++++-
+ 5 files changed, 82 insertions(+), 5 deletions(-)
+
+diff --git a/src/dotnet.zig b/src/dotnet.zig
+index c0f7ec6..f0f4176 100644
+--- a/src/dotnet.zig
++++ b/src/dotnet.zig
+@@ -113,10 +113,16 @@ fn doGetDotnetValues(
+     dotnet_instrumentation_disabled: bool,
+     minimum_dotnet_major_version: u32,
+ ) ?DotnetValues {
+-    if (dotnet_instrumentation_disabled or dotnet_path_prefix.len == 0) {
++    if (dotnet_instrumentation_disabled) {
+         print.printInfo("Skipping the injection of the .NET OpenTelemetry instrumentation because it has been explicitly disabled.", .{});
+         return null;
+     }
++    if (dotnet_path_prefix.len == 0) {
++        // ADOT: not configured is the normal state for every runtime the pod does not use; this runs in every
++        // process, so keep it at debug.
++        print.printDebug("Not injecting the .NET auto-instrumentation: no agent path configured.", .{});
++        return null;
++    }
+ 
+     if (libc_info == null) {
+         print.printError("invariant violated: libc info has not been set prior to calling getDotnetValues().", .{});
+@@ -162,6 +168,18 @@ fn doGetDotnetValues(
+         };
+         for (paths_to_check) |p| {
+             std.fs.cwd().access(p, .{}) catch |err| {
++                if (std.fs.cwd().access(dotnet_path_prefix, .{})) |_| {
++                    std.fs.cwd().access(dotnet_values.otel_auto_home, .{}) catch {
++                        // ADOT: the SDK is there but has no build for this libc flavor; expected, not an error.
++                        print.printDebug("Not injecting the .NET auto-instrumentation: no build for this libc flavor in \"{s}\".", .{dotnet_path_prefix});
++                        cached_dotnet_values = .{
++                            .values = null,
++                            .done = true,
++                        };
++                        dotnet_values.freeAll(gpa);
++                        return null;
++                    };
++                } else |_| {}
+                 print.printError("Skipping injection of the .NET OpenTelemetry instrumentation because of an issue accessing {s}: {}", .{ p, err });
+                 cached_dotnet_values = .{
+                     .values = null,
+diff --git a/src/jvm.zig b/src/jvm.zig
+index dd4f407..3ba3ce7 100644
+--- a/src/jvm.zig
++++ b/src/jvm.zig
+@@ -36,10 +36,16 @@ fn doCheckOTelJavaAgentJarAndGetModifiedJavaToolOptionsValue(
+     jvm_auto_instrumentation_agent_path: []u8,
+     jvm_instrumentation_disabled: bool,
+ ) ?[:0]u8 {
+-    if (jvm_instrumentation_disabled or jvm_auto_instrumentation_agent_path.len == 0) {
++    if (jvm_instrumentation_disabled) {
+         print.printInfo("Skipping the injection of the OpenTelemetry Java agent in \"JAVA_TOOL_OPTIONS\" because it has been explicitly disabled.", .{});
+         return null;
+     }
++    if (jvm_auto_instrumentation_agent_path.len == 0) {
++        // ADOT: not configured is the normal state for every runtime the pod does not use; this runs in every
++        // process, so keep it at debug.
++        print.printDebug("Not injecting the Java auto-instrumentation: no agent path configured.", .{});
++        return null;
++    }
+ 
+     // Check the existence of the Jar file: by passing a `-javaagent` to a
+     // jar file that does not exist or cannot be opened will crash the JVM
+diff --git a/src/nodejs.zig b/src/nodejs.zig
+index 47ff51c..f41df79 100644
+--- a/src/nodejs.zig
++++ b/src/nodejs.zig
+@@ -36,10 +36,16 @@ fn doCheckNodeJsAutoInstrumentationAgentAndGetModifiedNodeOptionsValue(
+     nodejs_auto_instrumentation_agent_path: []u8,
+     nodejs_instrumentation_disabled: bool,
+ ) ?[:0]u8 {
+-    if (nodejs_instrumentation_disabled or nodejs_auto_instrumentation_agent_path.len == 0) {
++    if (nodejs_instrumentation_disabled) {
+         print.printInfo("Skipping the injection of the Node.js OpenTelemetry auto-instrumentation because it has been explicitly disabled.", .{});
+         return null;
+     }
++    if (nodejs_auto_instrumentation_agent_path.len == 0) {
++        // ADOT: not configured is the normal state for every runtime the pod does not use; this runs in every
++        // process, so keep it at debug.
++        print.printDebug("Not injecting the Node.js auto-instrumentation: no agent path configured.", .{});
++        return null;
++    }
+ 
+     // Check the existence of the Node module: requiring or importing a module
+     // that does not exist or cannot be opened will crash the Node.js process
+diff --git a/src/python.zig b/src/python.zig
+index 80d39ef..7b51502 100644
+--- a/src/python.zig
++++ b/src/python.zig
+@@ -42,10 +42,16 @@ fn doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue(
+     python_auto_instrumentation_agent_path_prefix: []u8,
+     python_instrumentation_disabled: bool,
+ ) ?[:0]u8 {
+-    if (python_instrumentation_disabled or python_auto_instrumentation_agent_path_prefix.len == 0) {
++    if (python_instrumentation_disabled) {
+         print.printInfo("Skipping the injection of the Python OpenTelemetry auto-instrumentation because it has been explicitly disabled.", .{});
+         return null;
+     }
++    if (python_auto_instrumentation_agent_path_prefix.len == 0) {
++        // ADOT: not configured is the normal state for every runtime the pod does not use; this runs in every
++        // process, so keep it at debug.
++        print.printDebug("Not injecting the Python auto-instrumentation: no agent path configured.", .{});
++        return null;
++    }
+ 
+     if (libc_info == null) {
+         print.printError("invariant violated: libc info has not been set prior to calling doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue().", .{});
+@@ -72,6 +78,11 @@ fn doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue(
+             // Check the existence of the Python directory, stand down if it does not exist.
+             std.fs.cwd().access(python_auto_instrumentation_agent_path, .{}) catch |err| {
+                 defer gpa.free(python_auto_instrumentation_agent_path);
++                if (std.fs.cwd().access(python_auto_instrumentation_agent_path_prefix, .{})) |_| {
++                    // ADOT: the SDK is there but has no build for this libc flavor; expected, not an error.
++                    print.printDebug("Not injecting the Python auto-instrumentation: no {s} build in \"{s}\".", .{ libc_flavor_suffix, python_auto_instrumentation_agent_path_prefix });
++                    return null;
++                } else |_| {}
+                 print.printError("Skipping the injection of the Python OpenTelemetry auto-instrumentation in \"{s}\" because of an issue accessing the directory at \"{s}\": {}", .{ pythonpath_env_var_name, python_auto_instrumentation_agent_path, err });
+                 return null;
+             };
+@@ -376,3 +387,24 @@ test "getModifiedPythonpathValue: should return null if the auto-instrumentation
+ fn _resetState() void {
+     libc_info = null;
+ }
++
++test "doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue: should return null if the prefix exists but has no build for the libc flavor" {
++    const allocator = testing.allocator;
++    _resetState();
++    defer _resetState();
++
++    var tmp = testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const prefix_path = try tmp.dir.realpathAlloc(allocator, ".");
++    defer allocator.free(prefix_path);
++
++    libc_info = test_util.testLibcInfo(.MUSL);
++    const modified_pythonpath_value =
++        doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue(
++            allocator,
++            null,
++            prefix_path,
++            false,
++        );
++    try test_util.expectWithMessage(modified_pythonpath_value == null, "modified_pythonpath_value == null");
++}
+diff --git a/src/ruby.zig b/src/ruby.zig
+index 1e4f29b..2ba6c49 100644
+--- a/src/ruby.zig
++++ b/src/ruby.zig
+@@ -47,6 +47,7 @@ pub fn checkRubyAutoInstrumentationAgentAndGetModifiedRubyoptValue(
+ 
+     // Stand down if the entry file does not exist; requiring a missing file would crash the Ruby process at startup.
+     std.fs.cwd().access(entry_file, .{}) catch |err| {
++        if (noBuildForThisLibc(configuration, libc_dir)) return null;
+         print.printError("Skipping the injection of the Ruby OpenTelemetry auto-instrumentation in \"{s}\" because of an issue accessing the entry point at \"{s}\": {}", .{ rubyopt_env_var_name, entry_file, err });
+         return null;
+     };
+@@ -79,7 +80,9 @@ pub fn getRubyAdditionalGemPath(
+     defer gpa.free(entry_file);
+ 
+     std.fs.cwd().access(entry_file, .{}) catch |err| {
+-        print.printError("Skipping the injection of the Ruby OpenTelemetry auto-instrumentation in \"{s}\" because of an issue accessing the entry point at \"{s}\": {}", .{ ruby_additional_gem_path_env_var_name, entry_file, err });
++        if (!noBuildForThisLibc(configuration, libc_dir)) {
++            print.printError("Skipping the injection of the Ruby OpenTelemetry auto-instrumentation in \"{s}\" because of an issue accessing the entry point at \"{s}\": {}", .{ ruby_additional_gem_path_env_var_name, entry_file, err });
++        }
+         gpa.free(libc_dir);
+         return null;
+     };
+@@ -87,6 +90,18 @@ pub fn getRubyAdditionalGemPath(
+     return libc_dir;
+ }
+ 
++/// ADOT: the prefix exists but has no directory for this libc flavor -- the SDK simply has no build for it. That is
++/// expected (e.g. a musl application with a glibc-only SDK), not an error; this runs in every process, so log at
++/// debug and let the caller stand down.
++fn noBuildForThisLibc(configuration: config.InjectorConfiguration, libc_dir: []const u8) bool {
++    std.fs.cwd().access(libc_dir, .{}) catch {
++        std.fs.cwd().access(configuration.ruby_auto_instrumentation_agent_path_prefix, .{}) catch return false;
++        print.printDebug("Not injecting the Ruby auto-instrumentation: no build for this libc flavor in \"{s}\".", .{configuration.ruby_auto_instrumentation_agent_path_prefix});
++        return true;
++    };
++    return false;
++}
++
+ /// Resolves <prefix>/<libc flavor> and returns it, or null if disabled, unconfigured, the prefix
+ /// contains whitespace, or the libc flavor is unknown.
+ fn determineLibcDir(gpa: std.mem.Allocator, configuration: config.InjectorConfiguration) ?[:0]u8 {

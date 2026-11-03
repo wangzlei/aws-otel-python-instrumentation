@@ -1,0 +1,907 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lei Wang <wangzl@amazon.com>
+Date: Tue, 3 Nov 2026 23:14:36 +0000
+Subject: [PATCH 1/4] Add a start-up guard that stops injecting into a
+ container that keeps failing
+
+When an injected auto-instrumentation agent keeps an application from
+starting (for example a dependency bundled with the agent shadowing the
+application's own version), Kubernetes restarts the same container in
+place and the agent is injected again every time, so the container
+crash-loops forever. The guard uses those restarts: at the start of
+every process, before any environment variable is modified, it looks at
+how the previous runs of the container went and, if they kept failing
+with the agent, injects nothing for this run.
+
+Rules (constants):
+- 3 consecutive runs that did not stay up for 60 s after the agent
+  finished initialising, each start less than 360 s after the previous
+  one (a run is a "fast failure"), or 2 consecutive runs that crashed
+  on an uncaught exception raised inside agent code -> stop injecting.
+- 2 further fast failures while not injecting -> the application fails
+  without the agent too; inject again and never stop in this pod.
+
+State: a few small files in the agent volume (the parent of the
+injector/ directory holding libotelinject.so, taken from LD_PRELOAD),
+named after the container (read from the kubelet's termination-log
+bind mount in /proc/self/mountinfo, else a hash of /proc/1/cmdline).
+The injector writes the counters; the agents report "initialised",
+"healthy after 60 s" and "crashed inside the agent". Only the first
+process of a container run (a new PID 1 start time) updates the state;
+all other processes of that run follow the recorded decision. Every
+write is atomic (temporary file + rename), the set of files and their
+sizes are bounded.
+
+The guard is active only on Kubernetes, only for the runtimes whose
+agent path is configured in the process, and can be turned off with
+AWS_INSTRUMENTATION_GUARD_ENABLED=false. Any error makes it behave as
+if it did not exist (inject). It uses raw Linux syscalls only, so it
+adds no libc dependency and no panic paths.
+---
+ src/adot_guard.zig | 816 +++++++++++++++++++++++++++++++++++++++++++++
+ src/root.zig       |   9 +
+ src/test.zig       |   1 +
+ 3 files changed, 826 insertions(+)
+ create mode 100644 src/adot_guard.zig
+
+diff --git a/src/adot_guard.zig b/src/adot_guard.zig
+new file mode 100644
+index 0000000..a82900c
+--- /dev/null
++++ b/src/adot_guard.zig
+@@ -0,0 +1,816 @@
++// Copyright The OpenTelemetry Authors
++// SPDX-License-Identifier: Apache-2.0
++
++//! ADOT start-up guard: stops injecting the auto-instrumentation into a container that keeps failing with it.
++//!
++//! Runs in every process before any environment variable is modified. Only the first process of a container run
++//! (a new PID 1 start time) updates the state; every other process of the same run reads the decision.
++//! The only setting is AWS_INSTRUMENTATION_GUARD_ENABLED=false (off). The guard only acts for the runtimes whose
++//! agent path is configured in this process. The state lives in the SDK volume, the parent directory of the
++//! injector/ directory that holds this libotelinject.so (taken from LD_PRELOAD); that volume (a Kubernetes emptyDir)
++//! keeps its content across container restarts. One file per writer, <id> = this container's name (from the kubelet's termination-log
++//! bind mount in /proc/self/mountinfo), else FNV-1a 32 of /proc/1/cmdline:
++//!   .adot-guard-<id>          written here: boot= fails= sdkcrash= skipped= skipfails= restored= pod=
++//!   .adot-guard-<id>.init     written by the SDK when it finished initialising: the boot id, then seconds since boot
++//!   .adot-guard-<id>.healthy  written by the SDK 60 s after that: the boot id
++//!   .adot-guard-<id>.crash    written by the SDK crash hook: the boot id, then "file:line ExcType"
++//! Any error -> behave exactly as without the guard (inject). See tools/otel-injector/SPEC.md.
++//! Uses raw Linux syscalls only (no libc, no std.posix wrappers with unreachable branches).
++
++const std = @import("std");
++const linux = std.os.linux;
++
++const auxv = @import("auxv.zig");
++const print = @import("print.zig");
++const proc_self_environ_parser = @import("proc_self_environ_parser.zig");
++
++const testing = std.testing;
++
++pub const injector_file_name = "libotelinject.so";
++
++const max_path = 1024;
++const max_file = 1024;
++
++pub const Config = struct {
++    max_failures: u32 = 3,
++    max_sdk_crashes: u32 = 2,
++    restore_after: u32 = 2,
++    crash_loop_seconds: u64 = 360,
++};
++
++pub const State = struct {
++    boot: u64 = 0,
++    fails: u32 = 0,
++    sdkcrash: u32 = 0,
++    skipped: bool = false,
++    skipfails: u32 = 0,
++    restored: bool = false,
++    pod: []const u8 = "",
++};
++
++/// What happened to the previous container run, as seen at the start of the next one.
++pub const Previous = struct {
++    healthy: bool,
++    sdk_crash: bool,
++    /// Seconds from the previous run's SDK-initialised time (else its start) to this start; null if not comparable.
++    seconds_since_start: ?u64,
++};
++
++pub const Transition = enum { none, fresh, started_skipping, still_skipping, restored, counted };
++
++pub const Decision = struct {
++    state: State,
++    skip: bool,
++    transition: Transition,
++};
++
++/// Pure decision for a new container run. prev_state is null for no (or unusable) state.
++pub fn decideNewRun(prev_state: ?State, prev: Previous, boot: u64, pod: []const u8, cfg: Config) Decision {
++    const p = prev_state orelse return .{ .state = .{ .boot = boot, .pod = pod }, .skip = false, .transition = .fresh };
++    const fast_fail = !prev.healthy and if (prev.seconds_since_start) |s| s < cfg.crash_loop_seconds else false;
++    var s = State{ .boot = boot, .pod = pod };
++    if (p.restored) {
++        // The app failed without the SDK as well: never skip again in this pod.
++        s.restored = true;
++        return .{ .state = s, .skip = false, .transition = .none };
++    }
++    if (p.skipped) {
++        s.fails = p.fails;
++        s.sdkcrash = p.sdkcrash;
++        s.skipfails = if (fast_fail) p.skipfails +| 1 else 0;
++        if (s.skipfails >= cfg.restore_after) {
++            s.restored = true;
++            return .{ .state = s, .skip = false, .transition = .restored };
++        }
++        s.skipped = true;
++        return .{ .state = s, .skip = true, .transition = .still_skipping };
++    }
++    s.fails = if (fast_fail) p.fails +| 1 else 0;
++    s.sdkcrash = if (prev.sdk_crash) p.sdkcrash +| 1 else 0;
++    if (s.fails >= cfg.max_failures or s.sdkcrash >= cfg.max_sdk_crashes) {
++        s.skipped = true;
++        return .{ .state = s, .skip = true, .transition = .started_skipping };
++    }
++    return .{ .state = s, .skip = false, .transition = .counted };
++}
++
++/// Parses "k=v k=v ..."; null if boot or fails are missing or malformed. pod points into content.
++pub fn parseState(content: []const u8) ?State {
++    var s = State{};
++    var have_boot = false;
++    var have_fails = false;
++    var it = std.mem.tokenizeAny(u8, content, " \t\r\n");
++    while (it.next()) |kv| {
++        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse return null;
++        const k = kv[0..eq];
++        const v = kv[eq + 1 ..];
++        if (std.mem.eql(u8, k, "boot")) {
++            s.boot = std.fmt.parseInt(u64, v, 10) catch return null;
++            have_boot = true;
++        } else if (std.mem.eql(u8, k, "fails")) {
++            s.fails = std.fmt.parseInt(u32, v, 10) catch return null;
++            have_fails = true;
++        } else if (std.mem.eql(u8, k, "sdkcrash")) {
++            s.sdkcrash = std.fmt.parseInt(u32, v, 10) catch return null;
++        } else if (std.mem.eql(u8, k, "skipfails")) {
++            s.skipfails = std.fmt.parseInt(u32, v, 10) catch return null;
++        } else if (std.mem.eql(u8, k, "skipped")) {
++            s.skipped = std.mem.eql(u8, v, "1");
++        } else if (std.mem.eql(u8, k, "restored")) {
++            s.restored = std.mem.eql(u8, v, "1");
++        } else if (std.mem.eql(u8, k, "pod")) {
++            s.pod = v;
++        }
++    }
++    if (!have_boot or !have_fails) return null;
++    return s;
++}
++
++pub fn formatState(buf: []u8, s: State) ![]u8 {
++    return std.fmt.bufPrint(buf, "boot={d} fails={d} pod={s} restored={d} sdkcrash={d} skipfails={d} skipped={d}\n", .{
++        s.boot, s.fails, s.pod, @intFromBool(s.restored), s.sdkcrash, s.skipfails, @intFromBool(s.skipped),
++    });
++}
++
++pub fn fnv1a32(data: []const u8) u32 {
++    var h: u32 = 0x811C9DC5;
++    for (data) |b| h = (h ^ b) *% 0x01000193;
++    return h;
++}
++
++/// Field 22 (starttime, clock ticks since boot) of a /proc/<pid>/stat line.
++pub fn parseStartTime(stat: []const u8) ?u64 {
++    const rp = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
++    var it = std.mem.tokenizeAny(u8, stat[rp + 1 ..], " \n");
++    var i: usize = 0;
++    while (it.next()) |tok| : (i += 1) {
++        if (i == 19) return std.fmt.parseInt(u64, tok, 10) catch null;
++    }
++    return null;
++}
++
++fn isPause(cmdline: []const u8) bool {
++    const argv0 = cmdline[0 .. std.mem.indexOfScalar(u8, cmdline, 0) orelse cmdline.len];
++    const base = argv0[(if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |i| i + 1 else 0)..];
++    return std.mem.eql(u8, base, "pause");
++}
++
++// ---- raw syscall I/O (errors are values, never panics) ----
++
++const IoError = error{ Syscall, PathTooLong, ShortWrite };
++
++fn ok(rc: usize) IoError!usize {
++    // Raw syscall convention: values in (-4096, -1] are -errno. (std.posix.errno would read libc's errno when
++    // linked against libc, as in the unit tests.)
++    const signed: isize = @bitCast(rc);
++    if (signed < 0 and signed > -4096) return error.Syscall;
++    return rc;
++}
++
++fn toZ(buf: []u8, path: []const u8) IoError![:0]const u8 {
++    if (path.len + 1 > buf.len) return error.PathTooLong;
++    @memcpy(buf[0..path.len], path);
++    buf[path.len] = 0;
++    return buf[0..path.len :0];
++}
++
++/// Reads up to buf.len bytes; null if the file does not exist or cannot be read.
++fn readFile(path: []const u8, buf: []u8) ?[]u8 {
++    var pbuf: [max_path]u8 = undefined;
++    const pz = toZ(&pbuf, path) catch return null;
++    const fd_rc = ok(linux.openat(linux.AT.FDCWD, pz, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, 0)) catch return null;
++    const fd: i32 = @intCast(fd_rc);
++    defer _ = linux.close(fd);
++    var n: usize = 0;
++    while (n < buf.len) {
++        const r = ok(linux.read(fd, buf[n..].ptr, buf.len - n)) catch return null;
++        if (r == 0) break;
++        n += r;
++    }
++    return buf[0..n];
++}
++
++fn writeAll(fd: i32, data: []const u8) IoError!void {
++    var off: usize = 0;
++    while (off < data.len) {
++        const w = try ok(linux.write(fd, data[off..].ptr, data.len - off));
++        if (w == 0) return error.ShortWrite;
++        off += w;
++    }
++}
++
++/// Writes a new file next to path and renames it over path, so readers never see a partial file.
++fn writeFileAtomic(path: []const u8, data: []const u8) IoError!void {
++    var rnd: [4]u8 = .{ 0, 0, 0, 0 };
++    _ = linux.getrandom(&rnd, rnd.len, 0);
++    var tbuf: [max_path]u8 = undefined;
++    const tmp = std.fmt.bufPrintZ(&tbuf, "{s}.{d}.{x}", .{ path, linux.getpid(), std.mem.readInt(u32, &rnd, .little) }) catch return error.PathTooLong;
++    var pbuf: [max_path]u8 = undefined;
++    const pz = try toZ(&pbuf, path);
++    const fd_rc = try ok(linux.openat(linux.AT.FDCWD, tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, 0o666));
++    const fd: i32 = @intCast(fd_rc);
++    writeAll(fd, data) catch |err| {
++        _ = linux.close(fd);
++        _ = linux.unlinkat(linux.AT.FDCWD, tmp, 0);
++        return err;
++    };
++    _ = linux.close(fd);
++    _ = ok(linux.renameat(linux.AT.FDCWD, tmp, linux.AT.FDCWD, pz)) catch |err| {
++        _ = linux.unlinkat(linux.AT.FDCWD, tmp, 0);
++        return err;
++    };
++}
++
++fn stderrLine(comptime fmt: []const u8, args: anytype) void {
++    var buf: [1024]u8 = undefined;
++    const line = std.fmt.bufPrint(&buf, "[adot-guard] " ++ fmt ++ "\n", args) catch return;
++    writeAll(2, line) catch {};
++}
++
++fn basename(path: []const u8) []const u8 {
++    return path[(if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| i + 1 else 0)..];
++}
++
++fn dirname(path: []const u8) []const u8 {
++    const i = std.mem.lastIndexOfScalar(u8, path, '/') orelse return "";
++    return if (i == 0) "/" else path[0..i];
++}
++
++/// The state directory: the SDK volume holding this injector. LD_PRELOAD entries are separated by ':' or ' '; the
++/// one named libotelinject.so (absolute path) is ours. <volume>/injector/libotelinject.so -> <volume> (the emptyDir
++/// root, writable by any user); a libotelinject.so directly in a directory -> that directory.
++pub fn stateDirFromLdPreload(ld_preload: []const u8) ?[]const u8 {
++    var it = std.mem.tokenizeAny(u8, ld_preload, ": ");
++    while (it.next()) |entry| {
++        if (entry.len == 0 or entry[0] != '/') continue;
++        if (!std.mem.eql(u8, basename(entry), injector_file_name)) continue;
++        const dir = dirname(entry);
++        if (std.mem.eql(u8, basename(dir), "injector")) {
++            const parent = dirname(dir);
++            return if (parent.len > 1) parent else null;
++        }
++        return if (dir.len > 1) dir else null;
++    }
++    return null;
++}
++
++/// This container's name, from the kubelet's termination-log bind mount: a /proc/self/mountinfo line whose root
++/// (field 4) ends in /pods/<pod uid>/containers/<container name>/<suffix>. The suffix changes on every restart, the
++/// name does not. Null if there is no such mount.
++pub fn containerNameFromMountinfo(mountinfo: []const u8) ?[]const u8 {
++    var lines = std.mem.splitScalar(u8, mountinfo, '\n');
++    while (lines.next()) |line| {
++        var fields = std.mem.tokenizeScalar(u8, line, ' ');
++        var i: usize = 0;
++        var root: []const u8 = "";
++        while (fields.next()) |f| : (i += 1) {
++            if (i == 3) {
++                root = f;
++                break;
++            }
++        }
++        if (root.len == 0) continue;
++        // last five components: pods, <uid>, containers, <name>, <suffix>
++        var comps: [5][]const u8 = undefined;
++        var n: usize = 0;
++        var rest = root;
++        while (n < 5) : (n += 1) {
++            const j = std.mem.lastIndexOfScalar(u8, rest, '/') orelse break;
++            comps[4 - n] = rest[j + 1 ..];
++            rest = rest[0..j];
++        }
++        if (n < 5) continue;
++        if (!std.mem.eql(u8, comps[0], "pods") or !std.mem.eql(u8, comps[2], "containers")) continue;
++        if (comps[1].len != 36 or comps[3].len == 0 or comps[3].len > 63 or comps[4].len == 0) continue;
++        var valid = true;
++        for (comps[3]) |c| {
++            if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-' or c == '.')) valid = false;
++        }
++        if (valid) return comps[3];
++    }
++    return null;
++}
++
++/// "<boot id>\n<seconds since node boot>\n" -> seconds, if the boot id matches.
++fn parseInitFile(content: []const u8, boot: u64) ?u64 {
++    var it = std.mem.tokenizeAny(u8, content, " \r\n");
++    const b = it.next() orelse return null;
++    if ((std.fmt.parseInt(u64, b, 10) catch return null) != boot) return null;
++    const secs = it.next() orelse return null;
++    const dot = std.mem.indexOfScalar(u8, secs, '.') orelse secs.len;
++    return std.fmt.parseInt(u64, secs[0..dot], 10) catch null;
++}
++
++/// True for a temporary file left by an interrupted atomic write of one of this container's files:
++/// "<base>.<anything>" where <base> is ".adot-guard-<id>" and the rest is not one of the known suffixes.
++pub fn isStaleTemp(name: []const u8, base: []const u8) bool {
++    if (!std.mem.startsWith(u8, name, base) or name.len <= base.len + 1 or name[base.len] != '.') return false;
++    const rest = name[base.len + 1 ..];
++    for ([_][]const u8{ "init", "healthy", "crash" }) |known| {
++        if (std.mem.eql(u8, rest, known)) return false;
++    }
++    // temporary names end in ".<pid>.<hex>" (from any of the writers)
++    return std.mem.indexOfScalar(u8, rest, '.') != null or std.ascii.isDigit(rest[0]);
++}
++
++/// Removes temporary files of this container left by interrupted writes (a process killed between creating and
++/// renaming), so the number of our files never grows with the restart count. Best effort.
++fn removeStaleTemps(dir: []const u8, base: []const u8) void {
++    var pbuf: [max_path]u8 = undefined;
++    const dz = toZ(&pbuf, dir) catch return;
++    const fd_rc = ok(linux.openat(linux.AT.FDCWD, dz, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0)) catch return;
++    const fd: i32 = @intCast(fd_rc);
++    defer _ = linux.close(fd);
++    var buf: [8192]u8 align(8) = undefined;
++    var rounds: usize = 0;
++    while (rounds < 64) : (rounds += 1) {
++        const n = ok(linux.getdents64(fd, &buf, buf.len)) catch return;
++        if (n == 0) return;
++        var off: usize = 0;
++        while (off + 19 < n) {
++            const reclen = std.mem.readInt(u16, buf[off + 16 ..][0..2], .little);
++            if (reclen == 0 or off + reclen > n) return;
++            const name = std.mem.sliceTo(buf[off + 19 .. off + reclen], 0);
++            if (isStaleTemp(name, base)) {
++                var nbuf: [max_path]u8 = undefined;
++                if (toZ(&nbuf, name)) |nz| {
++                    _ = linux.unlinkat(fd, nz, 0);
++                } else |_| {}
++            }
++            off += reclen;
++        }
++    }
++}
++
++// ---- evaluation ----
++
++pub const Env = struct {
++    k8s: bool,
++    enabled: bool,
++    state_dir: ?[]const u8,
++    container_name: ?[]const u8,
++    /// The languages this injector manages in this process (those whose agent path is configured), e.g. "python"
++    /// or "java,python". Empty: the injector manages none, so the guard does nothing. null (tests): unspecified.
++    languages: ?[]const u8 = null,
++    cfg: Config = .{},
++};
++
++pub const Proc = struct {
++    cmdline: []const u8,
++    boot: u64,
++    pod: []const u8,
++    clk_tck: u64,
++};
++
++pub const Result = enum {
++    /// The guard does not apply (or failed): inject as usual.
++    off,
++    /// Inject as usual; the guard is active for this run.
++    inject,
++    /// Do not inject anything.
++    skip,
++};
++
++/// Evaluates the guard for this process. path_buf is scratch space for the state file path.
++pub fn evaluateWith(env: Env, proc: Proc, path_buf: []u8) Result {
++    if (!env.k8s or !env.enabled) return .off;
++    // Nothing managed by the injector here (e.g. every language uses the old injection): nothing to protect, so
++    // do not count, skip or log.
++    const langs = env.languages orelse "the auto-instrumentation";
++    if (langs.len == 0) return .off;
++    const dir = env.state_dir orelse return .off;
++    if (dir.len == 0 or dir[0] != '/') return .off;
++    if (isPause(proc.cmdline)) {
++        print.printDebug("adot-guard: off, PID 1 is the pod's pause process (shareProcessNamespace)", .{});
++        return .off;
++    }
++    var idbuf: [16]u8 = undefined;
++    const id = if (env.container_name) |g| g else std.fmt.bufPrint(&idbuf, "{x:0>8}", .{fnv1a32(proc.cmdline)}) catch return .off;
++    if (id.len == 0 or std.mem.indexOfScalar(u8, id, '/') != null) return .off;
++    const path = std.fmt.bufPrint(path_buf, "{s}/.adot-guard-{s}", .{ std.mem.trimRight(u8, dir, "/"), id }) catch return .off;
++
++    var sbuf: [max_file]u8 = undefined;
++    var prev_state: ?State = if (readFile(path, &sbuf)) |c| parseState(c) else null;
++    if (prev_state) |p| {
++        if (!std.mem.eql(u8, p.pod, proc.pod)) prev_state = null; // left by another pod
++    }
++    if (prev_state) |p| {
++        if (p.boot == proc.boot) {
++            // Same container run: the first process already decided.
++            if (p.skipped) return .skip;
++            return .inject;
++        }
++    }
++
++    // A new container run: look at how the previous run ended.
++    var prev = Previous{ .healthy = false, .sdk_crash = false, .seconds_since_start = null };
++    var crash_desc: []const u8 = "";
++    var hbuf: [64]u8 = undefined;
++    var cbuf: [max_file]u8 = undefined;
++    var ibuf: [128]u8 = undefined;
++    var xbuf: [max_path]u8 = undefined;
++    if (prev_state) |p| {
++        if (proc.clk_tck > 0 and proc.boot >= p.boot) {
++            const now_s = proc.boot / proc.clk_tck;
++            prev.seconds_since_start = (proc.boot - p.boot) / proc.clk_tck;
++            // Measure from when the SDK finished initialising, if it did: a slow SDK start-up then does not hide a
++            // crash right after it.
++            const ip = std.fmt.bufPrint(&xbuf, "{s}.init", .{path}) catch return .off;
++            if (readFile(ip, &ibuf)) |c| {
++                if (parseInitFile(c, p.boot)) |init_s| {
++                    if (now_s >= init_s) prev.seconds_since_start = now_s - init_s;
++                }
++            }
++        }
++        const hp = std.fmt.bufPrint(&xbuf, "{s}.healthy", .{path}) catch return .off;
++        if (readFile(hp, &hbuf)) |h| {
++            prev.healthy = (std.fmt.parseInt(u64, std.mem.trim(u8, h, " \r\n"), 10) catch 0) == p.boot;
++        }
++        const cp = std.fmt.bufPrint(&xbuf, "{s}.crash", .{path}) catch return .off;
++        if (readFile(cp, &cbuf)) |c| {
++            const nl = std.mem.indexOfScalar(u8, c, '\n') orelse c.len;
++            if ((std.fmt.parseInt(u64, std.mem.trim(u8, c[0..nl], " \r"), 10) catch 0) == p.boot) {
++                prev.sdk_crash = true;
++                crash_desc = std.mem.trim(u8, c[@min(nl + 1, c.len)..], " \r\n");
++            }
++        }
++    }
++
++    removeStaleTemps(std.mem.trimRight(u8, dir, "/"), basename(path));
++    const d = decideNewRun(prev_state, prev, proc.boot, proc.pod, env.cfg);
++    var obuf: [max_file]u8 = undefined;
++    const out = formatState(&obuf, d.state) catch return .off;
++    writeFileAtomic(path, out) catch |err| {
++        // No writable volume: the guard turns itself off and the SDK loads as usual. Said once per container run
++        // (by PID 1, the first process), not in every process.
++        if (linux.getpid() == 1) {
++            stderrLine("start-up check is off: cannot write {s} ({})", .{ path, err });
++        } else {
++            print.printDebug("adot-guard: start-up check is off, cannot write {s}: {}", .{ path, err });
++        }
++        return .off;
++    };
++
++    switch (d.transition) {
++        .started_skipping => {
++            if (d.state.sdkcrash >= env.cfg.max_sdk_crashes) {
++                stderrLine("ADOT SDK skipped for {s}: the application crashed inside the SDK {d} times in a row (last: {s})", .{ langs, d.state.sdkcrash, crash_desc });
++            } else {
++                stderrLine("ADOT SDK skipped for {s}: this container failed to start {d} times in a row with it", .{ langs, d.state.fails });
++            }
++        },
++        .still_skipping => stderrLine("ADOT SDK skipped for {s} (decided earlier in this pod)", .{langs}),
++        .restored => stderrLine("ADOT SDK restored for {s}: the container kept failing without it, so the SDK was not the cause", .{langs}),
++        else => {},
++    }
++    return if (d.skip) .skip else .inject;
++}
++
++/// Production entry point: reads the environment from /proc/self/environ and process data from /proc.
++pub fn evaluate(allocator: std.mem.Allocator, path_buf: []u8) Result {
++    const getenv = proc_self_environ_parser.getenv;
++    const k8s = getenv(allocator, "KUBERNETES_SERVICE_HOST");
++    defer if (k8s) |v| allocator.free(v);
++    if (k8s == null or k8s.?.len == 0) return .off;
++    const enabled = getenv(allocator, "AWS_INSTRUMENTATION_GUARD_ENABLED");
++    defer if (enabled) |v| allocator.free(v);
++    if (enabled) |v| {
++        if (std.ascii.eqlIgnoreCase(v, "false")) return .off;
++    }
++    const ld_preload = getenv(allocator, "LD_PRELOAD");
++    defer if (ld_preload) |v| allocator.free(v);
++    const state_dir = stateDirFromLdPreload(ld_preload orelse return .off) orelse return .off;
++
++    // Languages this injector manages here: those whose agent path the operator configured. Others (e.g. a language
++    // still injected the old way in a mixed per-language setup) are not affected by the guard.
++    var lbuf: [64]u8 = undefined;
++    var llen: usize = 0;
++    inline for (.{
++        .{ "JVM_AUTO_INSTRUMENTATION_AGENT_PATH", "java" },
++        .{ "NODEJS_AUTO_INSTRUMENTATION_AGENT_PATH", "nodejs" },
++        .{ "PYTHON_AUTO_INSTRUMENTATION_AGENT_PATH_PREFIX", "python" },
++        .{ "DOTNET_AUTO_INSTRUMENTATION_AGENT_PATH_PREFIX", "dotnet" },
++        .{ "RUBY_AUTO_INSTRUMENTATION_AGENT_PATH_PREFIX", "ruby" },
++    }) |pair| {
++        const v = getenv(allocator, pair[0]);
++        defer if (v) |x| allocator.free(x);
++        if (v) |x| {
++            if (x.len > 0) {
++                const sep: []const u8 = if (llen > 0) "," else "";
++                const w = std.fmt.bufPrint(lbuf[llen..], "{s}{s}", .{ sep, pair[1] }) catch return .off;
++                llen += w.len;
++            }
++        }
++    }
++    if (llen == 0) return .off;
++
++    const mibuf = allocator.alloc(u8, 256 * 1024) catch return .off;
++    defer allocator.free(mibuf);
++    const name: ?[]const u8 = if (readFile("/proc/self/mountinfo", mibuf)) |mi| containerNameFromMountinfo(mi) else null;
++
++    var cmdbuf: [4096]u8 = undefined;
++    const cmdline = readFile("/proc/1/cmdline", &cmdbuf) orelse return .off;
++    var statbuf: [2048]u8 = undefined;
++    const stat = readFile("/proc/1/stat", &statbuf) orelse return .off;
++    const boot = parseStartTime(stat) orelse return .off;
++    var uts: linux.utsname = undefined;
++    _ = ok(linux.uname(&uts)) catch return .off;
++    const pod = std.mem.sliceTo(&uts.nodename, 0);
++    var clk: u64 = auxv.getauxval(17);
++    if (clk == 0) clk = 100;
++
++    return evaluateWith(.{
++        .k8s = true,
++        .enabled = true,
++        .state_dir = state_dir,
++        .container_name = name,
++        .languages = lbuf[0..llen],
++    }, .{ .cmdline = cmdline, .boot = boot, .pod = pod, .clk_tck = clk }, path_buf);
++}
++
++// ---- tests ----
++
++const fast = Previous{ .healthy = false, .sdk_crash = false, .seconds_since_start = 5 };
++const healthy_prev = Previous{ .healthy = true, .sdk_crash = false, .seconds_since_start = 3600 };
++
++test "decideNewRun: no state starts fresh and injects" {
++    const d = decideNewRun(null, fast, 100, "p", .{});
++    try testing.expect(!d.skip);
++    try testing.expectEqual(Transition.fresh, d.transition);
++    try testing.expectEqual(@as(u32, 0), d.state.fails);
++}
++
++test "decideNewRun: three fast failures skip from the fourth start" {
++    var s = decideNewRun(null, fast, 1, "p", .{}).state;
++    var i: u64 = 2;
++    while (i <= 3) : (i += 1) {
++        const d = decideNewRun(s, fast, i, "p", .{});
++        try testing.expect(!d.skip);
++        s = d.state;
++    }
++    const d4 = decideNewRun(s, fast, 4, "p", .{});
++    try testing.expect(d4.skip);
++    try testing.expectEqual(Transition.started_skipping, d4.transition);
++    try testing.expectEqual(@as(u32, 3), d4.state.fails);
++}
++
++test "decideNewRun: a healthy run resets the count" {
++    const s = State{ .boot = 1, .fails = 2, .pod = "p" };
++    const d = decideNewRun(s, healthy_prev, 2, "p", .{});
++    try testing.expectEqual(@as(u32, 0), d.state.fails);
++    try testing.expect(!d.skip);
++}
++
++test "decideNewRun: an unmarked run long ago is not a failure" {
++    const s = State{ .boot = 1, .fails = 2, .pod = "p" };
++    const d = decideNewRun(s, .{ .healthy = false, .sdk_crash = false, .seconds_since_start = 400 }, 2, "p", .{});
++    try testing.expectEqual(@as(u32, 0), d.state.fails);
++    const unknown = decideNewRun(s, .{ .healthy = false, .sdk_crash = false, .seconds_since_start = null }, 2, "p", .{});
++    try testing.expectEqual(@as(u32, 0), unknown.state.fails);
++}
++
++test "decideNewRun: two crashes inside the SDK skip" {
++    const s0 = State{ .boot = 1, .pod = "p" };
++    const crash_late = Previous{ .healthy = true, .sdk_crash = true, .seconds_since_start = 120 };
++    const d1 = decideNewRun(s0, crash_late, 2, "p", .{});
++    try testing.expect(!d1.skip);
++    try testing.expectEqual(@as(u32, 1), d1.state.sdkcrash);
++    const d2 = decideNewRun(d1.state, crash_late, 3, "p", .{});
++    try testing.expect(d2.skip);
++    try testing.expectEqual(Transition.started_skipping, d2.transition);
++    // A crash outside the SDK in between resets the count.
++    const reset = decideNewRun(d1.state, healthy_prev, 3, "p", .{});
++    try testing.expectEqual(@as(u32, 0), reset.state.sdkcrash);
++}
++
++test "decideNewRun: still failing without the SDK restores it, then never skips again" {
++    const skipped = State{ .boot = 4, .fails = 3, .skipped = true, .pod = "p" };
++    const d1 = decideNewRun(skipped, fast, 5, "p", .{});
++    try testing.expect(d1.skip);
++    try testing.expectEqual(@as(u32, 1), d1.state.skipfails);
++    const d2 = decideNewRun(d1.state, fast, 6, "p", .{});
++    try testing.expect(!d2.skip);
++    try testing.expectEqual(Transition.restored, d2.transition);
++    try testing.expect(d2.state.restored);
++    var s = d2.state;
++    var i: u64 = 7;
++    while (i < 12) : (i += 1) {
++        const d = decideNewRun(s, fast, i, "p", .{});
++        try testing.expect(!d.skip);
++        s = d.state;
++    }
++}
++
++test "decideNewRun: skipped and then running long keeps skipping" {
++    const skipped = State{ .boot = 4, .fails = 3, .skipped = true, .skipfails = 1, .pod = "p" };
++    const d = decideNewRun(skipped, .{ .healthy = false, .sdk_crash = false, .seconds_since_start = 7200 }, 5, "p", .{});
++    try testing.expect(d.skip);
++    try testing.expectEqual(@as(u32, 0), d.state.skipfails);
++}
++
++test "parseState / formatState round trip and malformed input" {
++    var buf: [256]u8 = undefined;
++    const s = State{ .boot = 42, .fails = 2, .sdkcrash = 1, .skipped = true, .skipfails = 1, .restored = false, .pod = "web-1" };
++    const out = try formatState(&buf, s);
++    const p = parseState(out).?;
++    try testing.expectEqual(@as(u64, 42), p.boot);
++    try testing.expectEqual(@as(u32, 2), p.fails);
++    try testing.expectEqual(@as(u32, 1), p.sdkcrash);
++    try testing.expect(p.skipped);
++    try testing.expectEqualStrings("web-1", p.pod);
++    try testing.expect(parseState("garbage") == null);
++    try testing.expect(parseState("") == null);
++    try testing.expect(parseState("boot=abc fails=1") == null);
++    try testing.expect(parseState("fails=1 skipped=1") == null);
++}
++
++test "parseStartTime and fnv1a32" {
++    const stat = "1 (python app) S 0 1 1 0 -1 4194560 1 0 0 0 0 0 0 0 20 0 1 0 98765 1000 100";
++    try testing.expectEqual(@as(?u64, 98765), parseStartTime(stat));
++    try testing.expect(parseStartTime("garbage") == null);
++    try testing.expectEqual(@as(u32, 0x811C9DC5), fnv1a32(""));
++    try testing.expectEqual(@as(u32, 0xe40c292c), fnv1a32("a"));
++}
++
++test "isPause" {
++    try testing.expect(isPause("/pause\x00"));
++    try testing.expect(!isPause("python\x00/app.py\x00"));
++}
++
++fn tmpPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
++    return tmp.dir.realpath(".", buf);
++}
++
++test "evaluateWith: does nothing when the injector manages no language" {
++    var tmp = std.testing.tmpDir(.{ .iterate = true });
++    defer tmp.cleanup();
++    var dbuf: [max_path]u8 = undefined;
++    const dir = try tmpPath(&tmp, &dbuf);
++    var pbuf: [max_path]u8 = undefined;
++    const env = Env{ .k8s = true, .enabled = true, .state_dir = dir, .container_name = "app", .languages = "" };
++    for ([_]u64{ 100, 200, 300, 400, 500 }) |b| {
++        try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = b, .pod = "p", .clk_tck = 100 }, &pbuf) == .off);
++    }
++    var it = tmp.dir.iterate();
++    try testing.expect((try it.next()) == null); // no state file written
++}
++
++test "evaluateWith: counts runs through the state files and skips" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var dbuf: [max_path]u8 = undefined;
++    const dir = try tmpPath(&tmp, &dbuf);
++    const env = Env{ .k8s = true, .enabled = true, .state_dir = dir, .container_name = "app" };
++    var pbuf: [max_path]u8 = undefined;
++    // clk_tck 100: boots 100 ticks apart = 1 s, a crash loop.
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 100, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 100, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject); // same run
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 200, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 300, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 400, .pod = "p", .clk_tck = 100 }, &pbuf) == .skip);
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 400, .pod = "p", .clk_tck = 100 }, &pbuf) == .skip); // same run
++    // Another pod finding this file starts fresh.
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 500, .pod = "q", .clk_tck = 100 }, &pbuf) == .inject);
++}
++
++test "evaluateWith: healthy mark and crash file written by the SDK" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var dbuf: [max_path]u8 = undefined;
++    const dir = try tmpPath(&tmp, &dbuf);
++    const env = Env{ .k8s = true, .enabled = true, .state_dir = dir, .container_name = "app" };
++    var pbuf: [max_path]u8 = undefined;
++    var boot: u64 = 1000;
++    var i: usize = 0;
++    // Healthy runs restarting quickly are never counted.
++    while (i < 5) : (i += 1) {
++        try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = boot, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++        var hb: [32]u8 = undefined;
++        try tmp.dir.writeFile(.{ .sub_path = ".adot-guard-app.healthy", .data = try std.fmt.bufPrint(&hb, "{d}", .{boot}) });
++        boot += 100;
++    }
++    // Two runs ending with a crash inside the SDK: the third start skips.
++    var j: usize = 0;
++    while (j < 2) : (j += 1) {
++        try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = boot, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++        var cb: [128]u8 = undefined;
++        try tmp.dir.writeFile(.{ .sub_path = ".adot-guard-app.crash", .data = try std.fmt.bufPrint(&cb, "{d}\n/sdk/x.py:3 ValueError\n", .{boot}) });
++        var hb: [32]u8 = undefined;
++        try tmp.dir.writeFile(.{ .sub_path = ".adot-guard-app.healthy", .data = try std.fmt.bufPrint(&hb, "{d}", .{boot}) });
++        boot += 100;
++    }
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = boot, .pod = "p", .clk_tck = 100 }, &pbuf) == .skip);
++}
++
++test "evaluateWith: off when not applicable or the directory is unusable" {
++    var pbuf: [max_path]u8 = undefined;
++    const proc = Proc{ .cmdline = "x", .boot = 1, .pod = "p", .clk_tck = 100 };
++    try testing.expect(evaluateWith(.{ .k8s = false, .enabled = true, .state_dir = "/tmp", .container_name = null }, proc, &pbuf) == .off);
++    try testing.expect(evaluateWith(.{ .k8s = true, .enabled = false, .state_dir = "/tmp", .container_name = null }, proc, &pbuf) == .off);
++    try testing.expect(evaluateWith(.{ .k8s = true, .enabled = true, .state_dir = null, .container_name = null }, proc, &pbuf) == .off);
++    try testing.expect(evaluateWith(.{ .k8s = true, .enabled = true, .state_dir = "relative", .container_name = null }, proc, &pbuf) == .off);
++    try testing.expect(evaluateWith(.{ .k8s = true, .enabled = true, .state_dir = "/does/not/exist", .container_name = null }, proc, &pbuf) == .off);
++    try testing.expect(evaluateWith(.{ .k8s = true, .enabled = true, .state_dir = "/tmp", .container_name = null }, .{ .cmdline = "/pause\x00", .boot = 1, .pod = "p", .clk_tck = 100 }, &pbuf) == .off);
++}
++
++test "stateDirFromLdPreload" {
++    try testing.expectEqualStrings("/otel-auto-instrumentation-python", stateDirFromLdPreload("/otel-auto-instrumentation-python/injector/libotelinject.so").?);
++    try testing.expectEqualStrings("/otel-auto-instrumentation-java", stateDirFromLdPreload("/usr/lib/libz.so.1:/otel-auto-instrumentation-java/injector/libotelinject.so").?);
++    try testing.expectEqualStrings("/otel-auto-instrumentation-java", stateDirFromLdPreload("libfoo.so /otel-auto-instrumentation-java/injector/libotelinject.so").?);
++    try testing.expectEqualStrings("/opt/x", stateDirFromLdPreload("/opt/x/libotelinject.so").?);
++    try testing.expect(stateDirFromLdPreload("/usr/lib/libz.so.1") == null);
++    try testing.expect(stateDirFromLdPreload("libotelinject.so") == null);
++    try testing.expect(stateDirFromLdPreload("/injector/libotelinject.so") == null);
++    try testing.expect(stateDirFromLdPreload("/libotelinject.so") == null);
++    try testing.expect(stateDirFromLdPreload("") == null);
++}
++
++test "containerNameFromMountinfo" {
++    const eks =
++        \\1984 1970 0:52 / / rw,relatime master:1 - overlay overlay rw
++        \\1993 1984 259:1 /var/lib/kubelet/pods/137644a5-3b1d-47e1-93ce-edbb7526f55c/containers/app/6732171a /dev/termination-log rw,noatime - xfs /dev/nvme0n1p1 rw
++        \\1994 1984 259:1 /var/lib/kubelet/pods/137644a5-3b1d-47e1-93ce-edbb7526f55c/etc-hosts /etc/hosts rw,noatime - xfs /dev/nvme0n1p1 rw
++    ;
++    try testing.expectEqualStrings("app", containerNameFromMountinfo(eks).?);
++    const kind = "5969 5961 259:1 /local/docker/volumes/v/_data/lib/kubelet/pods/f314a3e3-7c6e-4624-9755-18e2cf823c0b/containers/log-shipper/1445bc94 /tmp/my-term rw - xfs /dev/x rw\n";
++    try testing.expectEqualStrings("log-shipper", containerNameFromMountinfo(kind).?);
++    try testing.expect(containerNameFromMountinfo("1 0 0:1 / / rw - overlay overlay rw\n") == null);
++    try testing.expect(containerNameFromMountinfo("") == null);
++    try testing.expect(containerNameFromMountinfo("1 0 0:1 /pods/short/containers/app/x /dev/t rw - xfs x rw") == null);
++    try testing.expect(containerNameFromMountinfo("1 0 0:1 /a/pods/f314a3e3-7c6e-4624-9755-18e2cf823c0b/containers/App/x /dev/t rw - xfs x rw") == null);
++}
++
++test "evaluateWith: a slow SDK start-up does not hide fast failures (init time)" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var dbuf: [max_path]u8 = undefined;
++    const dir = try tmpPath(&tmp, &dbuf);
++    const env = Env{ .k8s = true, .enabled = true, .state_dir = dir, .container_name = "app" };
++    var pbuf: [max_path]u8 = undefined;
++    // Each run: SDK init takes 300 s, the app fails 2 s later, the next start is 10 s after that.
++    // Starts are 312 s apart plus back-off; with 400 s apart the start-to-start gap is beyond the 360 s window,
++    // the init-to-start gap (100 s) is not.
++    var boot: u64 = 100 * 1000;
++    var i: usize = 0;
++    while (i < 3) : (i += 1) {
++        try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = boot, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++        var ib: [64]u8 = undefined;
++        try tmp.dir.writeFile(.{ .sub_path = ".adot-guard-app.init", .data = try std.fmt.bufPrint(&ib, "{d}\n{d}.42\n", .{ boot, boot / 100 + 300 }) });
++        boot += 400 * 100;
++    }
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = boot, .pod = "p", .clk_tck = 100 }, &pbuf) == .skip);
++}
++
++test "evaluateWith: without an init file the start-to-start gap is used" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var dbuf: [max_path]u8 = undefined;
++    const dir = try tmpPath(&tmp, &dbuf);
++    const env = Env{ .k8s = true, .enabled = true, .state_dir = dir, .container_name = null };
++    var pbuf: [max_path]u8 = undefined;
++    var boot: u64 = 100 * 1000;
++    var i: usize = 0;
++    while (i < 5) : (i += 1) {
++        try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = boot, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++        boot += 400 * 100; // restarts 400 s apart, never counted
++    }
++}
++
++test "parseInitFile" {
++    try testing.expectEqual(@as(?u64, 1234), parseInitFile("77\n1234.56\n", 77));
++    try testing.expectEqual(@as(?u64, 1234), parseInitFile("77 1234", 77));
++    try testing.expect(parseInitFile("78\n1234\n", 77) == null);
++    try testing.expect(parseInitFile("garbage", 77) == null);
++    try testing.expect(parseInitFile("77\n", 77) == null);
++}
++
++test "isStaleTemp" {
++    const base = ".adot-guard-app";
++    try testing.expect(isStaleTemp(".adot-guard-app.123.ab12cd34", base));
++    try testing.expect(isStaleTemp(".adot-guard-app.crash.77.ff", base));
++    try testing.expect(isStaleTemp(".adot-guard-app.healthy.5.1a2b", base));
++    try testing.expect(!isStaleTemp(".adot-guard-app", base));
++    try testing.expect(!isStaleTemp(".adot-guard-app.crash", base));
++    try testing.expect(!isStaleTemp(".adot-guard-app.init", base));
++    try testing.expect(!isStaleTemp(".adot-guard-app.healthy", base));
++    try testing.expect(!isStaleTemp(".adot-guard-other.123.ab", base));
++    try testing.expect(!isStaleTemp(".adot-guard-app-2.123.ab", base));
++    try testing.expect(!isStaleTemp("glibc", base));
++}
++
++test "evaluateWith: stale temporary files are removed on a new run" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    var dbuf: [max_path]u8 = undefined;
++    const dir = try tmpPath(&tmp, &dbuf);
++    try tmp.dir.writeFile(.{ .sub_path = ".adot-guard-app.99.deadbeef", .data = "x" });
++    try tmp.dir.writeFile(.{ .sub_path = ".adot-guard-app.crash.98.cafe", .data = "x" });
++    try tmp.dir.writeFile(.{ .sub_path = ".adot-guard-other.97.beef", .data = "x" });
++    const env = Env{ .k8s = true, .enabled = true, .state_dir = dir, .container_name = "app" };
++    var pbuf: [max_path]u8 = undefined;
++    try testing.expect(evaluateWith(env, .{ .cmdline = "x", .boot = 100, .pod = "p", .clk_tck = 100 }, &pbuf) == .inject);
++    try testing.expectError(error.FileNotFound, tmp.dir.access(".adot-guard-app.99.deadbeef", .{}));
++    try testing.expectError(error.FileNotFound, tmp.dir.access(".adot-guard-app.crash.98.cafe", .{}));
++    try tmp.dir.access(".adot-guard-other.97.beef", .{}); // another container's file is left alone
++    try tmp.dir.access(".adot-guard-app", .{});
++}
+diff --git a/src/root.zig b/src/root.zig
+index 9aeba40..69b3f28 100644
+--- a/src/root.zig
++++ b/src/root.zig
+@@ -18,6 +18,7 @@ const res_attrs = @import("resource_attributes.zig");
+ const types = @import("types.zig");
+ const pattern_matcher = @import("patterns_matcher.zig");
+ const args_parser = @import("args_parser.zig");
++const adot_guard = @import("adot_guard.zig");
+ 
+ const init_section_name = switch (builtin.target.os.tag) {
+     .linux => ".init_array",
+@@ -59,6 +60,14 @@ fn initEnviron() callconv(.c) void {
+         return;
+     }
+ 
++    // ADOT start-up guard: decide, before any modification, whether this container keeps failing with the
++    // auto-instrumentation; if so, modify nothing at all.
++    var adot_guard_path_buf: [1024]u8 = undefined;
++    const adot_guard_result = adot_guard.evaluate(allocator, &adot_guard_path_buf);
++    if (adot_guard_result == .skip) {
++        return;
++    }
++
+     const libc_info = libc.getLibCInfo(allocator) catch |err| {
+         if (err == error.UnknownLibCFlavor) {
+             print.printError("no libc found: {}", .{err});
+diff --git a/src/test.zig b/src/test.zig
+index 9384892..61af536 100644
+--- a/src/test.zig
++++ b/src/test.zig
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ // All files with unit tests need to be referenced here:
++pub const adot_guard = @import("adot_guard.zig");
+ pub const arg_parser = @import("args_parser.zig");
+ pub const auxv = @import("auxv.zig");
+ pub const config = @import("config.zig");

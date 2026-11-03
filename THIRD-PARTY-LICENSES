@@ -2,6 +2,7 @@
 
 ** opentelemetry-python; version 1.22.0 -- https://github.com/open-telemetry/opentelemetry-python
 ** opentelemetry-python-contrib; version 0.43b0 -- https://github.com/open-telemetry/opentelemetry-python-contrib
+** opentelemetry-injector; version 0.11.0 -- https://github.com/open-telemetry/opentelemetry-injector
  
                                  Apache License
                            Version 2.0, January 2004

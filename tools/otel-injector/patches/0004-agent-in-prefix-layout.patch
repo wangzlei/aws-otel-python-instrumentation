@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Lei Wang <wangzl@amazon.com>
+Date: Tue, 3 Nov 2026 23:14:36 +0000
+Subject: [PATCH 4/4] python, dotnet: support an agent laid out directly in the
+ path prefix
+
+Upstream expects <prefix>/<glibc|musl>/... . Kubernetes operators copy
+the auto-instrumentation images as they are, with the agent directly
+in <prefix> (Python: <prefix>/opentelemetry/..., .NET:
+<prefix>/{net,linux-<arch>,linux-musl-<arch>}). When <prefix>/<libc>
+does not exist but such a layout does, use it:
+
+- Python: PYTHONPATH as in the previous change, for glibc and musl.
+- .NET: OTEL_DOTNET_AUTO_HOME=<prefix>, the startup hook from
+  <prefix>/net, and the native profiler for the detected libc and
+  architecture (linux-<arch> or linux-musl-<arch>); the managed part is
+  shared by both libc flavours.
+
+This keeps the images usable by existing operators and avoids shipping
+the agent twice.
+---
+ src/dotnet.zig | 57 +++++++++++++++++++++++++++++++++++++++-----------
+ src/python.zig | 35 ++++++++++++++++++++++++++++++-
+ 2 files changed, 79 insertions(+), 13 deletions(-)
+
+diff --git a/src/dotnet.zig b/src/dotnet.zig
+index f0f4176..cf9e23f 100644
+--- a/src/dotnet.zig
++++ b/src/dotnet.zig
+@@ -869,23 +869,33 @@ fn determineDotnetValues(
+     };
+     defer gpa.free(platform);
+ 
+-    const coreclr_profiler_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}/{s}/OpenTelemetry.AutoInstrumentation.Native.so", .{
+-        dotnet_path_prefix, libc_flavor_prefix, platform,
+-    }, 0);
++    // ADOT: without a <prefix>/<libc> directory, the SDK laid out directly in <prefix> (the ADOT image layout the
++    // operator has always used: <prefix>/{net,linux-x64,linux-musl-x64,...}) is used, with the native profiler for
++    // this libc and architecture; the managed part is shared by both libc flavors.
++    const libc_dir = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dotnet_path_prefix, libc_flavor_prefix });
++    defer gpa.free(libc_dir);
++    var use_root = false;
++    std.fs.cwd().access(libc_dir, .{}) catch {
++        const marker = try std.fmt.allocPrint(gpa, "{s}/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll", .{dotnet_path_prefix});
++        defer gpa.free(marker);
++        if (std.fs.cwd().access(marker, .{})) |_| {
++            use_root = true;
++        } else |_| {}
++    };
++    const base = if (use_root) try gpa.dupe(u8, dotnet_path_prefix) else try gpa.dupe(u8, libc_dir);
++    defer gpa.free(base);
+ 
+-    const additional_deps = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}/AdditionalDeps", .{
+-        dotnet_path_prefix, libc_flavor_prefix,
++    const coreclr_profiler_path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}/OpenTelemetry.AutoInstrumentation.Native.so", .{
++        base, platform,
+     }, 0);
+ 
+-    const otel_auto_home = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dotnet_path_prefix, libc_flavor_prefix }, 0);
++    const additional_deps = try std.fmt.allocPrintSentinel(gpa, "{s}/AdditionalDeps", .{base}, 0);
+ 
+-    const shared_store = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}/store", .{
+-        dotnet_path_prefix, libc_flavor_prefix,
+-    }, 0);
++    const otel_auto_home = try std.fmt.allocPrintSentinel(gpa, "{s}", .{base}, 0);
+ 
+-    const startup_hooks = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll", .{
+-        dotnet_path_prefix, libc_flavor_prefix,
+-    }, 0);
++    const shared_store = try std.fmt.allocPrintSentinel(gpa, "{s}/store", .{base}, 0);
++
++    const startup_hooks = try std.fmt.allocPrintSentinel(gpa, "{s}/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll", .{base}, 0);
+ 
+     return .{
+         .coreclr_enable_profiling = coreclr_enable_profiling_value,
+@@ -1130,3 +1140,26 @@ fn _resetState() void {
+     };
+     libc_info = null;
+ }
++
++test "determineDotnetValues: ADOT root layout without a libc directory" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.makePath("net");
++    try tmp.dir.writeFile(.{ .sub_path = "net/OpenTelemetry.AutoInstrumentation.StartupHook.dll", .data = "" });
++    var buf: [std.fs.max_path_bytes]u8 = undefined;
++    const dir = try tmp.dir.realpath(".", &buf);
++    const prefix = try std.testing.allocator.dupe(u8, dir);
++    defer std.testing.allocator.free(prefix);
++    const v = try determineDotnetValues(std.testing.allocator, prefix, .MUSL, .x86_64);
++    defer v.freeAll(std.testing.allocator);
++    const want_profiler = try std.fmt.allocPrint(std.testing.allocator, "{s}/linux-musl-x64/OpenTelemetry.AutoInstrumentation.Native.so", .{dir});
++    defer std.testing.allocator.free(want_profiler);
++    try testing.expectEqualStrings(want_profiler, v.coreclr_profiler_path);
++    try testing.expectEqualStrings(dir, v.otel_auto_home);
++    try tmp.dir.makeDir("glibc");
++    const g = try determineDotnetValues(std.testing.allocator, prefix, .GNU, .aarch64);
++    defer g.freeAll(std.testing.allocator);
++    const want_g = try std.fmt.allocPrint(std.testing.allocator, "{s}/glibc/linux-arm64/OpenTelemetry.AutoInstrumentation.Native.so", .{dir});
++    defer std.testing.allocator.free(want_g);
++    try testing.expectEqualStrings(want_g, g.coreclr_profiler_path);
++}
+diff --git a/src/python.zig b/src/python.zig
+index 7b51502..8f2f078 100644
+--- a/src/python.zig
++++ b/src/python.zig
+@@ -79,7 +79,13 @@ fn doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue(
+             std.fs.cwd().access(python_auto_instrumentation_agent_path, .{}) catch |err| {
+                 defer gpa.free(python_auto_instrumentation_agent_path);
+                 if (std.fs.cwd().access(python_auto_instrumentation_agent_path_prefix, .{})) |_| {
+-                    // ADOT: the SDK is there but has no build for this libc flavor; expected, not an error.
++                    // ADOT: no <prefix>/<libc> directory. An SDK laid out directly in <prefix> (the ADOT image
++                    // layout the operator has always used: <prefix>/opentelemetry/...) is used as it is, for any libc,
++                    // exactly as the operator's PYTHONPATH does today; otherwise there is no build for this libc.
++                    if (isRootLayoutPythonSdk(gpa, python_auto_instrumentation_agent_path_prefix)) {
++                        const root = gpa.dupeZ(u8, python_auto_instrumentation_agent_path_prefix) catch return null;
++                        return getModifiedPythonpathValue(gpa, original_value_optional, root);
++                    }
+                     print.printDebug("Not injecting the Python auto-instrumentation: no {s} build in \"{s}\".", .{ libc_flavor_suffix, python_auto_instrumentation_agent_path_prefix });
+                     return null;
+                 } else |_| {}
+@@ -212,6 +218,14 @@ test "doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue: should
+     try test_util.expectWithMessage(modified_pythonpath_value == null, "modified_pythonpath_value == null");
+ }
+ 
++/// ADOT: <prefix>/opentelemetry/instrumentation/auto_instrumentation/sitecustomize.py exists.
++fn isRootLayoutPythonSdk(gpa: std.mem.Allocator, prefix: []const u8) bool {
++    const p = std.fmt.allocPrint(gpa, "{s}/opentelemetry/instrumentation/auto_instrumentation/sitecustomize.py", .{prefix}) catch return false;
++    defer gpa.free(p);
++    std.fs.cwd().access(p, .{}) catch return false;
++    return true;
++}
++
+ fn determinePythonpathWithLibcSuffix(
+     gpa: std.mem.Allocator,
+     python_auto_instrumentation_agent_path_prefix: []u8,
+@@ -408,3 +422,22 @@ test "doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue: should
+         );
+     try test_util.expectWithMessage(modified_pythonpath_value == null, "modified_pythonpath_value == null");
+ }
++
++test "ADOT root layout: an SDK directly in the prefix is used for any libc" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    try tmp.dir.makePath("opentelemetry/instrumentation/auto_instrumentation");
++    try tmp.dir.writeFile(.{ .sub_path = "opentelemetry/instrumentation/auto_instrumentation/sitecustomize.py", .data = "" });
++    var buf: [std.fs.max_path_bytes]u8 = undefined;
++    const dir = try tmp.dir.realpath(".", &buf);
++    const prefix = try testing.allocator.dupe(u8, dir);
++    defer testing.allocator.free(prefix);
++    _resetState();
++    defer _resetState();
++    libc_info = test_util.testLibcInfo(.MUSL);
++    const v = doCheckPythonAutoInstrumentationAgentAndGetModifiedPythonpathValue(testing.allocator, null, prefix, false) orelse return error.TestUnexpectedResult;
++    defer testing.allocator.free(v);
++    const want = try std.fmt.allocPrint(testing.allocator, "{s}/opentelemetry/instrumentation/auto_instrumentation:{s}", .{ dir, dir });
++    defer testing.allocator.free(want);
++    try testing.expectEqualStrings(want, v);
++}
