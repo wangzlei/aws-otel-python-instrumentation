@@ -1,0 +1,137 @@
+# Weekly check for a new upstream OpenTelemetry Injector release (Dependabot cannot track it: upstream publishes
+# GitHub release assets only). If there is one, points tools/otel-injector/UPSTREAM at it, runs build.sh and opens a
+# PR. If the ADOT patches no longer apply or the tests fail, the PR is opened as a draft with the build log, so that
+# a maintainer can rebase the patches.
+name: OTel Injector Upstream Bump
+on:
+  schedule:
+    - cron: "0 9 * * 2" # Tuesdays 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to move to (default the latest upstream release), e.g. v0.12.0
+        required: false
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on:
+      - codebuild-adot-python-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - image:ubuntu-8.0
+      - instance-size:large
+    steps:
+      - name: Configure AWS credentials for BOT secrets
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 #v5.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_SECRETS_MANAGER }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Get Bot secrets
+        uses: aws-actions/aws-secretsmanager-get-secrets@a9a7eb4e2f2871d30dc5b892576fde60a2ecc802 #v2.0.10
+        id: bot_secrets
+        with:
+          secret-ids: |
+            BOT_TOKEN ,${{ secrets.BOT_TOKEN_SECRET_ARN }}
+          parse-json-secrets: true
+
+      - name: Checkout main branch
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        with:
+          ref: main
+          token: ${{ env.BOT_TOKEN_GITHUB_RW_PATOKEN }}
+
+      - name: Set up CodeBuild runner
+        uses: ./.github/actions/codebuild-runner-setup
+
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Update UPSTREAM
+        id: bump
+        env:
+          GH_TOKEN: ${{ env.BOT_TOKEN_GITHUB_RW_PATOKEN }}
+          REQUESTED_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set +e
+          tag=$(tools/otel-injector/bump-upstream.sh "$REQUESTED_TAG")
+          rc=$?
+          set -e
+          if [ "$rc" -eq 3 ]; then
+            echo "Already up to date."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$rc" -eq 0 ] || exit "$rc"
+          branch="otel-injector-upstream-$tag"
+          if [ -n "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            echo "A PR for $branch is already open."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "updated=true"
+            echo "tag=$tag"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build with the new upstream
+        id: build
+        if: steps.bump.outputs.updated == 'true'
+        run: |
+          set +e
+          tools/otel-injector/build.sh "${{ runner.temp }}/otel-injector" > "${{ runner.temp }}/build.log" 2>&1
+          rc=$?
+          set -e
+          tail -n 50 "${{ runner.temp }}/build.log"
+          if [ "$rc" -eq 0 ]; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Create pull request
+        if: steps.bump.outputs.updated == 'true'
+        env:
+          GITHUB_TOKEN: ${{ env.BOT_TOKEN_GITHUB_RW_PATOKEN }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+          BUILD_OK: ${{ steps.build.outputs.ok }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git checkout -b "$BRANCH"
+          git add tools/otel-injector/UPSTREAM THIRD-PARTY-LICENSES
+          git commit -m "chore(otel-injector): update upstream OpenTelemetry Injector to $TAG"
+          git push origin "$BRANCH"
+
+          body="${{ runner.temp }}/pr-body.md"
+          {
+            echo "Updates tools/otel-injector/UPSTREAM to OpenTelemetry Injector $TAG ($(sed -n 's/^UPSTREAM_REPO=//p' tools/otel-injector/UPSTREAM)/releases/tag/$TAG)."
+            echo
+            if [ "$BUILD_OK" = "true" ]; then
+              echo "\`tools/otel-injector/build.sh\` passed: all ADOT patches apply and the upstream and guard tests pass."
+            else
+              echo "**\`tools/otel-injector/build.sh\` failed.** The ADOT patches need to be rebased onto $TAG (see tools/otel-injector/README.md, \"Updating upstream\"). Last lines of the build log ($RUN_URL):"
+              echo
+              echo '```'
+              tail -n 150 "${{ runner.temp }}/build.log"
+              echo '```'
+            fi
+            echo
+            echo "By submitting this pull request, I confirm that you can use, modify, copy, and redistribute this contribution, under the terms of your choice."
+          } > "$body"
+
+          draft=()
+          [ "$BUILD_OK" = "true" ] || draft=(--draft)
+          gh pr create --title "chore(otel-injector): update upstream OpenTelemetry Injector to $TAG" \
+                       --body-file "$body" \
+                       --head "$BRANCH" \
+                       --base main \
+                       "${draft[@]}"
