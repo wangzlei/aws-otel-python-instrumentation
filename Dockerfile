@@ -20,7 +20,38 @@ RUN sed -i "/opentelemetry-exporter-otlp-proto-grpc/d" ./aws-opentelemetry-distr
 
 RUN mkdir workspace && pip install --target workspace ./aws-opentelemetry-distro
 
-# Stage 2: Build the cp-utility binary
+# Replace the upstream auto_instrumentation sitecustomize.py with the start-up guard version, which runs the same
+# initialize() and additionally reports to the OTel Injector how the run went (inert without the Injector, so the
+# operator's current injection behaves exactly as before). Fail the build if upstream changed the file, so that its new
+# content is reviewed and carried over instead of silently dropped.
+RUN set -e; \
+    target=workspace/opentelemetry/instrumentation/auto_instrumentation/sitecustomize.py; \
+    grep -qx "from opentelemetry.instrumentation.auto_instrumentation import initialize" "$target"; \
+    [ "$(grep -cv '^\(#.*\)\?$' "$target")" = "2" ]; \
+    grep -qx "initialize()" "$target"; \
+    cp workspace/amazon/opentelemetry/distro/startup_guard_sitecustomize.py "$target"; \
+    rm -f workspace/opentelemetry/instrumentation/auto_instrumentation/__pycache__/sitecustomize.*.pyc
+
+# Stage 2: Download the pinned OTel Injector release (built in tools/otel-injector of this repository) and verify it.
+# Both architectures go into every image; cp-utility installs only the one matching the node.
+# The last two checks read the ELF e_machine field (offset 18, little endian): 62 = x86_64, 183 = aarch64.
+# TODO: the defaults are the development release; set them to the first official aws-otel-injector-v* release.
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/alpine:3.22 AS otel-injector
+ARG OTEL_INJECTOR_RELEASE_BASE_URL=https://github.com/aws-observability/aws-otel-python-instrumentation/releases/download
+ARG OTEL_INJECTOR_VERSION=0.11.0
+ARG OTEL_INJECTOR_SHA256_AMD64=4ef7be2aafcddd144786df8c7c19044e0299c7b629b239f420cf65f9592dde5d
+ARG OTEL_INJECTOR_SHA256_ARM64=950c74615f1870f7451603afe4dd0a90a9caad921ea3cc3c881cbdc63d04acbe
+WORKDIR /out
+RUN set -e; \
+    base="${OTEL_INJECTOR_RELEASE_BASE_URL}/aws-otel-injector-v${OTEL_INJECTOR_VERSION}"; \
+    wget -q -O libotelinject_amd64.so "${base}/libotelinject_amd64.so"; \
+    wget -q -O libotelinject_arm64.so "${base}/libotelinject_arm64.so"; \
+    echo "${OTEL_INJECTOR_SHA256_AMD64}  libotelinject_amd64.so" | sha256sum -c -; \
+    echo "${OTEL_INJECTOR_SHA256_ARM64}  libotelinject_arm64.so" | sha256sum -c -; \
+    [ "$(od -An -j18 -N2 -tu2 libotelinject_amd64.so | tr -d ' ')" = "62" ]; \
+    [ "$(od -An -j18 -N2 -tu2 libotelinject_arm64.so | tr -d ' ')" = "183" ]
+
+# Stage 3: Build the cp-utility binary
 FROM public.ecr.aws/docker/library/rust:1.89 AS builder
 
 WORKDIR /usr/src/cp-utility
@@ -51,7 +82,7 @@ RUN if [ $TARGETARCH = "amd64" ]; then export ARCH="x86_64" ; \
     && cargo test  --target ${ARCH}-unknown-linux-musl \
     && cargo install --target ${ARCH}-unknown-linux-musl --path . --root .
 
-# Stage 3: Build the distribution image by copying the THIRD-PARTY-LICENSES, the custom built cp command from stage 2, and the installed ADOT Python from stage 1 to their respective destinations
+# Stage 4: Build the distribution image by copying the THIRD-PARTY-LICENSES, the custom built cp command from stage 3, the installed ADOT Python from stage 1 and the OTel Injector from stage 2 to their respective destinations
 FROM scratch
 
 # Required to copy attribute files to distributed docker images
@@ -59,3 +90,4 @@ ADD THIRD-PARTY-LICENSES ./THIRD-PARTY-LICENSES
 
 COPY --from=builder /usr/src/cp-utility/bin/cp-utility /bin/cp
 COPY --from=build /operator-build/workspace /autoinstrumentation
+COPY --from=otel-injector /out /autoinstrumentation/injector
