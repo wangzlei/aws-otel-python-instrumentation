@@ -1,0 +1,141 @@
+# Weekly check for a newer aws-otel-injector-v* release (built from tools/otel-injector of this repository).
+# If there is one, updates the Injector version and checksums the auto-instrumentation image is built with
+# (Dockerfile build-arg defaults) and opens a PR. Dependabot cannot track GitHub release assets.
+# The newest release is the most recently published one, not the highest semver: v0.11.0-1 (an ADOT patch update
+# of upstream v0.11.0) is newer than v0.11.0 but sorts before it in semver.
+name: OTel Injector Pin Bump
+on:
+  schedule:
+    - cron: "0 10 * * 2" # Tuesdays 10:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Injector release to pin (default the newest one), e.g. 0.11.0 or 0.11.0-1
+        required: false
+
+env:
+  AWS_DEFAULT_REGION: us-east-1
+  RELEASE_REPOSITORY: aws-observability/aws-otel-python-instrumentation
+  TAG_PREFIX: aws-otel-injector-v
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on:
+      - codebuild-adot-python-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - image:ubuntu-8.0
+      - instance-size:large
+    steps:
+      - name: Configure AWS credentials for BOT secrets
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 #v5.0.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_SECRETS_MANAGER }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Get Bot secrets
+        uses: aws-actions/aws-secretsmanager-get-secrets@a9a7eb4e2f2871d30dc5b892576fde60a2ecc802 #v2.0.10
+        id: bot_secrets
+        with:
+          secret-ids: |
+            BOT_TOKEN ,${{ secrets.BOT_TOKEN_SECRET_ARN }}
+          parse-json-secrets: true
+
+      - name: Checkout main branch
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+        with:
+          ref: main
+          token: ${{ env.BOT_TOKEN_GITHUB_RW_PATOKEN }}
+
+      - name: Set up CodeBuild runner
+        uses: ./.github/actions/codebuild-runner-setup
+
+      - name: Setup Git
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Find the release to pin
+        id: find
+        env:
+          GH_TOKEN: ${{ env.BOT_TOKEN_GITHUB_RW_PATOKEN }}
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          current=$(sed -n 's/^ARG OTEL_INJECTOR_VERSION=//p' Dockerfile)
+          if [ -n "$REQUESTED_VERSION" ]; then
+            version="$REQUESTED_VERSION"
+          else
+            tag=$(gh release list --repo "$RELEASE_REPOSITORY" --limit 100 --exclude-drafts --exclude-pre-releases \
+                    --json tagName,publishedAt \
+                    --jq "[.[] | select(.tagName | startswith(\"$TAG_PREFIX\"))] | sort_by(.publishedAt) | last | .tagName // \"\"")
+            if [ -z "$tag" ]; then
+              echo "No $TAG_PREFIX* release found."
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            version="${tag#"$TAG_PREFIX"}"
+          fi
+          if [ "$version" = "$current" ]; then
+            echo "Already pinned to $version."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          branch="otel-injector-pin-$version"
+          if [ -n "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            echo "A PR for $branch is already open."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "updated=true"
+            echo "current=$current"
+            echo "version=$version"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update the pinned version and checksums
+        if: steps.find.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ env.BOT_TOKEN_GITHUB_RW_PATOKEN }}
+          VERSION: ${{ steps.find.outputs.version }}
+        run: |
+          dir="${{ runner.temp }}/otel-injector-release"
+          mkdir -p "$dir"
+          gh release download "$TAG_PREFIX$VERSION" --repo "$RELEASE_REPOSITORY" --dir "$dir" --clobber
+          (cd "$dir" && sha256sum -c SHA256SUMS)
+          amd64=$(awk '$2 == "libotelinject_amd64.so" {print $1}' "$dir/SHA256SUMS")
+          arm64=$(awk '$2 == "libotelinject_arm64.so" {print $1}' "$dir/SHA256SUMS")
+          [ ${#amd64} -eq 64 ] && [ ${#arm64} -eq 64 ]
+          sed -i -e "s/^ARG OTEL_INJECTOR_VERSION=.*/ARG OTEL_INJECTOR_VERSION=$VERSION/" \
+                 -e "s/^ARG OTEL_INJECTOR_SHA256_AMD64=.*/ARG OTEL_INJECTOR_SHA256_AMD64=$amd64/" \
+                 -e "s/^ARG OTEL_INJECTOR_SHA256_ARM64=.*/ARG OTEL_INJECTOR_SHA256_ARM64=$arm64/" Dockerfile
+          # The license entry carries the upstream version (the release version without the -N ADOT suffix).
+          upstream="${VERSION%%-*}"
+          sed -i "s|^\*\* opentelemetry-injector; version [^ ]* --|** opentelemetry-injector; version $upstream --|" THIRD-PARTY-LICENSES
+          git diff --stat
+
+      - name: Create pull request
+        if: steps.find.outputs.updated == 'true'
+        env:
+          GITHUB_TOKEN: ${{ env.BOT_TOKEN_GITHUB_RW_PATOKEN }}
+          VERSION: ${{ steps.find.outputs.version }}
+          CURRENT: ${{ steps.find.outputs.current }}
+          BRANCH: ${{ steps.find.outputs.branch }}
+        run: |
+          git checkout -b "$BRANCH"
+          git add Dockerfile THIRD-PARTY-LICENSES
+          git commit -m "chore(image): pin OTel Injector $VERSION"
+          git push origin "$BRANCH"
+          gh pr create --title "chore(image): pin OTel Injector $VERSION" \
+                       --body "Updates the OTel Injector shipped in the auto-instrumentation image from $CURRENT to $VERSION ($GITHUB_SERVER_URL/$RELEASE_REPOSITORY/releases/tag/$TAG_PREFIX$VERSION); the checksums come from the release's SHA256SUMS.
+
+          By submitting this pull request, I confirm that you can use, modify, copy, and redistribute this contribution, under the terms of your choice." \
+                       --head "$BRANCH" \
+                       --base main \
+                       --label "skip changelog"
