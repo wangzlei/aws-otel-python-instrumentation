@@ -1,0 +1,93 @@
+# Releases the ADOT build of the OpenTelemetry Injector (tools/otel-injector) on its own, independent of the Python
+# SDK release. Run it manually when the Injector changed; the SDK repositories (Python, Java, Node.js, .NET) pin a
+# release and pick up new ones through their own weekly bump workflows.
+name: OTel Injector Release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The Injector version to release, e.g. 0.1.0 (creates the tag otel-injector-v<version>)
+        required: true
+
+env:
+  VERSION: ${{ github.event.inputs.version }}
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    environment: Release
+    runs-on:
+      - codebuild-adot-python-runner-${{ github.run_id }}-${{ github.run_attempt }}
+      - image:ubuntu-8.0
+      - instance-size:large
+    env:
+      INJECTOR_DIR: ${{ github.workspace }}/otel-injector-out
+    steps:
+      - name: Check the version input
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must look like 1.2.3, got '$VERSION'"
+            exit 1
+          fi
+
+      - name: Checkout Repo @ SHA - ${{ github.sha }}
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
+
+      - name: Set up CodeBuild runner
+        uses: ./.github/actions/codebuild-runner-setup
+
+      - name: Check that the release does not exist yet
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "otel-injector-v$VERSION" > /dev/null 2>&1; then
+            echo "otel-injector-v$VERSION already exists; pick a new version."
+            exit 1
+          fi
+
+      # Downloads and verifies upstream and Zig, applies the ADOT patches, runs `zig fmt --check` and the upstream
+      # unit tests (including the start-up guard's), and builds x86_64 and aarch64.
+      - name: Build OTel Injector
+        run: tools/otel-injector/build.sh "$INJECTOR_DIR"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 #v4.2.2
+        with:
+          subject-path: |
+            ${{ env.INJECTOR_DIR }}/libotelinject_amd64.so
+            ${{ env.INJECTOR_DIR }}/libotelinject_arm64.so
+
+      - name: Upload OTel Injector artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 #v4.6.2
+        with:
+          name: otel-injector-${{ env.VERSION }}
+          path: ${{ env.INJECTOR_DIR }}
+          if-no-files-found: error
+
+      # A tag separate from the SDK's v<version>; --latest=false keeps the SDK release as the repository's latest.
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_TAG=$(sed -n 's/^UPSTREAM_TAG=//p' tools/otel-injector/UPSTREAM)
+          cat > release_notes.md << EOF
+          ADOT build of the OpenTelemetry Injector: upstream $UPSTREAM_TAG plus the patches in tools/otel-injector.
+          The ADOT auto-instrumentation images copy these files in; see tools/otel-injector/README.md.
+
+          SHA256SUMS:
+          \`\`\`
+          $(cat "$INJECTOR_DIR/SHA256SUMS")
+          \`\`\`
+          EOF
+          gh release create "otel-injector-v$VERSION" \
+            "$INJECTOR_DIR/libotelinject_amd64.so" \
+            "$INJECTOR_DIR/libotelinject_arm64.so" \
+            "$INJECTOR_DIR/SHA256SUMS" \
+            --target "$GITHUB_SHA" \
+            --title "OTel Injector v$VERSION" \
+            --notes-file release_notes.md \
+            --latest=false
