@@ -23,10 +23,7 @@ permissions:
 jobs:
   release:
     environment: Release
-    runs-on:
-      - codebuild-adot-python-runner-${{ github.run_id }}-${{ github.run_attempt }}
-      - image:ubuntu-8.0
-      - instance-size:large
+    runs-on: ubuntu-latest # TEMPORARY for fork validation only
     env:
       INJECTOR_DIR: ${{ github.workspace }}/otel-injector-out
     steps:
