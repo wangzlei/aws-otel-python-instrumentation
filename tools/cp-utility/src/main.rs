@@ -70,6 +70,44 @@ fn parse_args(args: Vec<&str>) -> io::Result<CopyOperation> {
     })
 }
 
+/// The OpenTelemetry injector is shipped once per architecture as `libotelinject_<arch>.so`.
+/// While copying, only the file built for this machine is installed, as `libotelinject.so`;
+/// the others are skipped. A wrong-architecture file in LD_PRELOAD makes musl refuse to start
+/// the process, while a missing file is ignored, so never install a non-matching one.
+/// This binary is statically linked for one architecture, so the architecture it was built
+/// for is the one it runs on.
+const INJECTOR_PREFIX: &str = "libotelinject_";
+const INJECTOR_SUFFIX: &str = ".so";
+const INJECTOR_NAME: &str = "libotelinject.so";
+
+fn machine_arch_name() -> &'static str {
+    match env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+/// Where a file named `name` goes in `dest_dir`: `None` to skip it.
+fn injector_destination(dest_dir: &Path, name: &std::ffi::OsStr, arch: &str) -> Option<PathBuf> {
+    if let Some(n) = name.to_str() {
+        if let Some(a) = n
+            .strip_prefix(INJECTOR_PREFIX)
+            .and_then(|rest| rest.strip_suffix(INJECTOR_SUFFIX))
+        {
+            if a.is_empty() {
+                return Some(dest_dir.join(name));
+            }
+            return if a == arch {
+                Some(dest_dir.join(INJECTOR_NAME))
+            } else {
+                None
+            };
+        }
+    }
+    Some(dest_dir.join(name))
+}
+
 /// Execute the copy operation
 fn do_copy(operation: CopyOperation) -> io::Result<()> {
     match operation.copy_type {
@@ -90,14 +128,15 @@ fn copy_recursive(source: &Path, dest: &Path) -> io::Result<()> {
             }
             for entry in fs::read_dir(current_source)? {
                 let next_source = entry?.path();
-                let next_dest =
-                    current_dest
-                        .clone()
-                        .join(next_source.file_name().ok_or(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "Invalid source file",
-                        ))?);
-                stack.push_back((next_source, next_dest));
+                let name = next_source.file_name().ok_or(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invalid source file",
+                ))?;
+                if let Some(next_dest) =
+                    injector_destination(&current_dest, name, machine_arch_name())
+                {
+                    stack.push_back((next_source, next_dest));
+                }
             }
         } else if current_source.is_symlink() {
             // Follow symbolic links as regular files
@@ -123,14 +162,15 @@ fn copy_archive(source: &Path, dest: &Path) -> io::Result<()> {
             }
             for entry in fs::read_dir(current_source)? {
                 let next_source = entry?.path();
-                let next_dest =
-                    current_dest
-                        .clone()
-                        .join(next_source.file_name().ok_or(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "Invalid source file",
-                        ))?);
-                stack.push_back((next_source, next_dest));
+                let name = next_source.file_name().ok_or(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Invalid source file",
+                ))?;
+                if let Some(next_dest) =
+                    injector_destination(&current_dest, name, machine_arch_name())
+                {
+                    stack.push_back((next_source, next_dest));
+                }
             }
         } else if current_source.is_file() {
             fs::copy(current_source, current_dest)?;
@@ -451,5 +491,71 @@ mod tests {
             fs::read_to_string(source).unwrap(),
             fs::read_to_string(dest).unwrap()
         );
+    }
+
+    #[test]
+    fn injector_destination_picks_matching_arch() {
+        let d = Path::new("/dst");
+        let f = |n: &str, a: &str| crate::injector_destination(d, std::ffi::OsStr::new(n), a);
+        assert_eq!(
+            f("libotelinject_amd64.so", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject.so"))
+        );
+        assert_eq!(f("libotelinject_arm64.so", "amd64"), None);
+        assert_eq!(
+            f("libotelinject_arm64.so", "arm64"),
+            Some(PathBuf::from("/dst/libotelinject.so"))
+        );
+        assert_eq!(f("libotelinject_amd64.so", "arm64"), None);
+        assert_eq!(
+            f("libotelinject.so", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject.so"))
+        );
+        assert_eq!(
+            f("libotelinject_.so", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject_.so"))
+        );
+        assert_eq!(f("other.so", "amd64"), Some(PathBuf::from("/dst/other.so")));
+        assert_eq!(
+            f("libotelinject_amd64.so.bak", "amd64"),
+            Some(PathBuf::from("/dst/libotelinject_amd64.so.bak"))
+        );
+    }
+
+    fn injector_tree_test(copy_type: CopyType) {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let inj = src.path().join("injector");
+        fs::create_dir(&inj).unwrap();
+        fs::write(inj.join("libotelinject_amd64.so"), b"amd64").unwrap();
+        fs::write(inj.join("libotelinject_arm64.so"), b"arm64").unwrap();
+        fs::write(inj.join("check-arch.sh"), b"sh").unwrap();
+        fs::write(src.path().join("sdk.py"), b"py").unwrap();
+        let out = dst.path().join("out");
+        do_copy(CopyOperation {
+            source: src.path().to_path_buf(),
+            destination: out.clone(),
+            copy_type,
+        })
+        .unwrap();
+        let mine = crate::machine_arch_name();
+        assert_eq!(
+            fs::read(out.join("injector/libotelinject.so")).unwrap(),
+            mine.as_bytes()
+        );
+        assert!(!out.join("injector/libotelinject_amd64.so").exists());
+        assert!(!out.join("injector/libotelinject_arm64.so").exists());
+        assert!(out.join("injector/check-arch.sh").exists());
+        assert!(out.join("sdk.py").exists());
+    }
+
+    #[test]
+    fn recursive_copy_installs_only_matching_injector() {
+        injector_tree_test(CopyType::Recursive);
+    }
+
+    #[test]
+    fn archive_copy_installs_only_matching_injector() {
+        injector_tree_test(CopyType::Archive);
     }
 }
