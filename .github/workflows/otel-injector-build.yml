@@ -1,0 +1,54 @@
+# Builds and tests the ADOT build of the OpenTelemetry Injector (tools/otel-injector) whenever it changes.
+# Releases are separate and manual (otel-injector-release.yml).
+name: OTel Injector Build
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+    branches:
+      - main
+      - "release/v*"
+    paths:
+      - "tools/otel-injector/**"
+      - ".github/workflows/otel-injector-build.yml"
+  push:
+    branches:
+      - main
+      - "release/v*"
+    paths:
+      - "tools/otel-injector/**"
+      - ".github/workflows/otel-injector-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    # Fork PRs run on GitHub-hosted runners; the CodeBuild webhook requires approval for them.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON(format('["codebuild-adot-python-runner-{0}-{1}", "image:ubuntu-8.0", "instance-size:large"]', github.run_id, github.run_attempt)) }}
+    steps:
+      - name: Checkout Repo @ SHA - ${{ github.sha }}
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #5.0.0
+
+      - name: Set up CodeBuild runner
+        uses: ./.github/actions/codebuild-runner-setup
+
+      # Downloads and verifies upstream and Zig, applies the ADOT patches, runs `zig fmt --check` and the upstream
+      # unit tests (including the start-up guard's), and builds x86_64 and aarch64.
+      - name: Build OTel Injector
+        run: tools/otel-injector/build.sh "${{ runner.temp }}/otel-injector"
+
+      - name: Upload OTel Injector artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 #v4.6.2
+        with:
+          name: otel-injector
+          path: ${{ runner.temp }}/otel-injector
+          if-no-files-found: error
