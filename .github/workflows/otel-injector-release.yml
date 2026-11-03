@@ -1,16 +1,19 @@
 # Releases the ADOT build of the OpenTelemetry Injector (tools/otel-injector) on its own, independent of the Python
 # SDK release. Run it manually when the Injector changed; the SDK repositories (Python, Java, Node.js, .NET) pin a
 # release and pick up new ones through their own weekly bump workflows.
+# Tag: aws-otel-injector-v<upstream version from UPSTREAM>[-<suffix>]; the suffix counts releases with changed ADOT
+# patches on the same upstream version (none for the first one).
 name: OTel Injector Release
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: The Injector version to release, e.g. 0.1.0 (creates the tag otel-injector-v<version>)
-        required: true
+      suffix:
+        description: Empty for the first release on the upstream version in UPSTREAM; 1, 2, ... for later releases with changed patches
+        required: false
+        default: ""
 
 env:
-  VERSION: ${{ github.event.inputs.version }}
+  SUFFIX: ${{ github.event.inputs.suffix }}
 
 permissions:
   contents: write
@@ -27,27 +30,35 @@ jobs:
     env:
       INJECTOR_DIR: ${{ github.workspace }}/otel-injector-out
     steps:
-      - name: Check the version input
-        run: |
-          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "version must look like 1.2.3, got '$VERSION'"
-            exit 1
-          fi
-
       - name: Checkout Repo @ SHA - ${{ github.sha }}
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 #v5.0.0
 
       - name: Set up CodeBuild runner
         uses: ./.github/actions/codebuild-runner-setup
 
-      - name: Check that the release does not exist yet
+      - name: Determine the release tag
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view "otel-injector-v$VERSION" > /dev/null 2>&1; then
-            echo "otel-injector-v$VERSION already exists; pick a new version."
+          UPSTREAM_TAG=$(sed -n 's/^UPSTREAM_TAG=//p' tools/otel-injector/UPSTREAM)
+          if ! [[ "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "unexpected UPSTREAM_TAG '$UPSTREAM_TAG' in tools/otel-injector/UPSTREAM"
             exit 1
           fi
+          if [ -n "$SUFFIX" ] && ! [[ "$SUFFIX" =~ ^[1-9][0-9]*$ ]]; then
+            echo "suffix must be empty or a positive integer, got '$SUFFIX'"
+            exit 1
+          fi
+          TAG="aws-otel-injector-$UPSTREAM_TAG${SUFFIX:+-$SUFFIX}"
+          if gh release view "$TAG" > /dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "$TAG already exists; use the next suffix."
+            exit 1
+          fi
+          echo "Releasing $TAG"
+          {
+            echo "TAG=$TAG"
+            echo "UPSTREAM_TAG=$UPSTREAM_TAG"
+          } >> "$GITHUB_ENV"
 
       # Downloads and verifies upstream and Zig, applies the ADOT patches, runs `zig fmt --check` and the upstream
       # unit tests (including the start-up guard's), and builds x86_64 and aarch64.
@@ -64,7 +75,7 @@ jobs:
       - name: Upload OTel Injector artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 #v4.6.2
         with:
-          name: otel-injector-${{ env.VERSION }}
+          name: ${{ env.TAG }}
           path: ${{ env.INJECTOR_DIR }}
           if-no-files-found: error
 
@@ -73,7 +84,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          UPSTREAM_TAG=$(sed -n 's/^UPSTREAM_TAG=//p' tools/otel-injector/UPSTREAM)
           cat > release_notes.md << EOF
           ADOT build of the OpenTelemetry Injector: upstream $UPSTREAM_TAG plus the patches in tools/otel-injector.
           The ADOT auto-instrumentation images copy these files in; see tools/otel-injector/README.md.
@@ -83,11 +93,11 @@ jobs:
           $(cat "$INJECTOR_DIR/SHA256SUMS")
           \`\`\`
           EOF
-          gh release create "otel-injector-v$VERSION" \
+          gh release create "$TAG" \
             "$INJECTOR_DIR/libotelinject_amd64.so" \
             "$INJECTOR_DIR/libotelinject_arm64.so" \
             "$INJECTOR_DIR/SHA256SUMS" \
             --target "$GITHUB_SHA" \
-            --title "OTel Injector v$VERSION" \
+            --title "$TAG" \
             --notes-file release_notes.md \
             --latest=false

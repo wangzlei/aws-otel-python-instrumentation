@@ -49,10 +49,15 @@ one from `PATH`, and builds in `/tmp/adot-otel-injector-build`, so that the outp
 ## Releases
 
 The Injector is released on its own, independent of the Python SDK release. When it changed (a patch, a new
-upstream version), run the `OTel Injector Release` workflow manually with a version (e.g. `0.1.0`). It builds the
-library at that commit and creates a GitHub release tagged `otel-injector-v<version>` with `libotelinject_amd64.so`,
-`libotelinject_arm64.so`, `SHA256SUMS` and a build provenance attestation. These tags are separate from the SDK's own
-`v<version>` tags, and the release is not marked as the repository's latest release.
+upstream version), run the `OTel Injector Release` workflow manually. It builds the library at that commit and
+creates a GitHub release with `libotelinject_amd64.so`, `libotelinject_arm64.so`, `SHA256SUMS` and a build
+provenance attestation, not marked as the repository's latest release.
+
+Tags follow the upstream version in `UPSTREAM`: `aws-otel-injector-v<upstream version>` (e.g.
+`aws-otel-injector-v0.11.0`) for the first release on an upstream version, then `aws-otel-injector-v0.11.0-1`,
+`-2`, … when only the ADOT patches changed. A new upstream version starts again without a suffix. The workflow takes
+the version from `UPSTREAM`; its only input is the suffix, and it refuses a tag that already exists. These tags are
+separate from the SDK's own `v<version>` tags.
 
 The build is reproducible (same files for the same commit), so `SHA256SUMS` identifies the binaries.
 
@@ -60,7 +65,7 @@ The build is reproducible (same files for the same commit), so `SHA256SUMS` iden
 
 All four SDK repositories (Python included, like the others) treat the Injector as a pinned external artifact:
 
-1. **Pin**: the image build pins one `otel-injector-v<version>` release, with the contents of its `SHA256SUMS`.
+1. **Pin**: the image build pins one `aws-otel-injector-v*` release, with the contents of its `SHA256SUMS`.
 2. **Verify**: it downloads `libotelinject_amd64.so` and `libotelinject_arm64.so`, checks them against the pinned
    checksums, and runs `check-arch.sh` on each (`libotelinject_amd64.so amd64`, `libotelinject_arm64.so arm64`).
 3. **Copy**: both files go into `/autoinstrumentation/injector/` of every architecture's image. The image's `cp`
@@ -68,8 +73,9 @@ All four SDK repositories (Python included, like the others) treat the Injector 
    init container copies the SDK. The image keeps today's `/autoinstrumentation` layout, so the old injection mode
    and older operators keep working.
 4. **Update**: each repository has a small weekly workflow that opens a PR bumping the pin (version and checksums)
-   when a newer `otel-injector-v*` release exists. Releases are cut only when something changed, so a newer release
-   always means new binaries.
+   when a newer `aws-otel-injector-v*` release exists. "Newer" means a later publish date, not a higher semantic
+   version: in semver `0.11.0-1` sorts before `0.11.0`. Releases are cut only when something changed, so a newer
+   release always means new binaries.
 
 ## Upstream updates
 
@@ -86,7 +92,7 @@ release the Injector afterwards.
    conflicts, and regenerate them with `git format-patch --no-signature --zero-commit`.
 3. If upstream has absorbed a change, delete that patch file and renumber the rest.
 4. Run `build.sh`; it must pass the upstream tests and the guard's tests.
-5. Release a new `otel-injector-v<version>`; the SDK repositories' weekly bump workflows pick it up.
+5. Release `aws-otel-injector-v<new upstream version>`; the SDK repositories' weekly bump workflows pick it up.
 
 Any change to the Injector ↔ SDK contract must keep it backward and forward compatible (see SPEC.md,
 "Compatibility").

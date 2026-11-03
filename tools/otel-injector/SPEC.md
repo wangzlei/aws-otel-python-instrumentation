@@ -27,7 +27,7 @@ Thresholds are constants: 3 fast failures, 60 s healthy, 360 s crash-loop window
 
 ## Compatibility
 
-The Injector and the SDK hooks are released separately (the SDK images pin an `otel-injector-v*` release), so a pod
+The Injector and the SDK hooks are released separately (the SDK images pin an `aws-otel-injector-v*` release), so a pod
 can combine a newer Injector with older SDK hooks or the other way round. The contract in this document (file names,
 formats, fields and their meaning) must therefore stay backward and forward compatible, and every change to it must
 follow these rules:
@@ -145,7 +145,7 @@ must fail if any test helper is present under `/autoinstrumentation` (including 
 
 ## Consumers
 
-All four SDK repositories, Python included, consume a pinned `otel-injector-v*` release with checksum
+All four SDK repositories, Python included, consume a pinned `aws-otel-injector-v*` release with checksum
 verification; see README.md, "How SDK repositories consume the Injector".
 
 ## Init container command
