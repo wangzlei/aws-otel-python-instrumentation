@@ -11,6 +11,11 @@ For any change that affects end users of this package, please add an entry under
 If your change does not need a CHANGELOG entry, add the "skip changelog" label to your PR.
 
 ## Unreleased
+- feat: the operator auto-instrumentation image ships the OTel Injector and the SDK side of a start-up guard: when
+  injected through the Injector on Kubernetes, the SDK is skipped automatically if it keeps the application from
+  starting, and restored if the application fails without it too. Injection by today's environment variables is
+  unchanged
+  ([#TBD](https://github.com/aws-observability/aws-otel-python-instrumentation/pull/TBD))
 - fix: in Lambda, treat `OTEL_EXPORTER_OTLP_ENDPOINT` as a custom trace endpoint, as the OTLP exporter
   spec requires. Setting only the generic endpoint previously fell back to the X-Ray UDP exporter, so
   traces never reached the configured collector
