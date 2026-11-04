@@ -32,15 +32,21 @@ RUN set -e; \
     cp workspace/amazon/opentelemetry/distro/startup_guard_sitecustomize.py "$target"; \
     rm -f workspace/opentelemetry/instrumentation/auto_instrumentation/__pycache__/sitecustomize.*.pyc
 
+# The upstream OTel Injector looks for the Python SDK at <prefix>/glibc or <prefix>/musl. These two self-referencing
+# links make the same files available at those paths, so one image serves both today's operator injection (which uses
+# /autoinstrumentation directly) and the Injector, without shipping the SDK twice. COPY and the image's cp
+# (tools/cp-utility) keep them as links.
+RUN ln -s . workspace/glibc && ln -s . workspace/musl
+
 # Stage 2: Download the pinned OTel Injector release (built in tools/otel-injector of this repository) and verify it.
 # Both architectures go into every image; cp-utility installs only the one matching the node.
 # The last two checks read the ELF e_machine field (offset 18, little endian): 62 = x86_64, 183 = aarch64.
 # TODO: the defaults are the development release; set them to the first official aws-otel-injector-v* release.
 FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/alpine:3.22 AS otel-injector
 ARG OTEL_INJECTOR_RELEASE_BASE_URL=https://github.com/aws-observability/aws-otel-python-instrumentation/releases/download
-ARG OTEL_INJECTOR_VERSION=0.11.0
-ARG OTEL_INJECTOR_SHA256_AMD64=4ef7be2aafcddd144786df8c7c19044e0299c7b629b239f420cf65f9592dde5d
-ARG OTEL_INJECTOR_SHA256_ARM64=950c74615f1870f7451603afe4dd0a90a9caad921ea3cc3c881cbdc63d04acbe
+ARG OTEL_INJECTOR_VERSION=0.11.0-1
+ARG OTEL_INJECTOR_SHA256_AMD64=c9ea9b2051d70ead7cca7155664c8dd927fc111b9b2e711795f95b985b03f4e0
+ARG OTEL_INJECTOR_SHA256_ARM64=879219069478636c9c2632cf6816076eb084d0b25fd5c0cb1adfbc25a9c26e34
 WORKDIR /out
 RUN set -e; \
     base="${OTEL_INJECTOR_RELEASE_BASE_URL}/aws-otel-injector-v${OTEL_INJECTOR_VERSION}"; \

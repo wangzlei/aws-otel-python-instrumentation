@@ -118,11 +118,29 @@ fn do_copy(operation: CopyOperation) -> io::Result<()> {
     Ok(())
 }
 
+/// Recreate the symbolic link `source` at `dest` with the same (possibly relative or dangling) target.
+/// An existing file or link at `dest` is replaced, so copying into a volume that was filled before (an init
+/// container that runs again) still succeeds; an existing real directory at `dest` is left as it is.
+fn copy_symlink(source: &Path, dest: &Path) -> io::Result<()> {
+    let target = source.read_link()?;
+    if let Ok(existing) = fs::symlink_metadata(dest) {
+        if existing.is_dir() {
+            return Ok(());
+        }
+        fs::remove_file(dest)?;
+    }
+    unix::fs::symlink(target, dest)
+}
+
 fn copy_recursive(source: &Path, dest: &Path) -> io::Result<()> {
     let mut stack = VecDeque::new();
     stack.push_back((source.to_path_buf(), dest.to_path_buf()));
     while let Some((current_source, current_dest)) = stack.pop_back() {
-        if current_source.is_dir() {
+        if current_source.is_symlink() {
+            // Copy symbolic links as symbolic links, like `cp -r`: never follow them, so a link to a
+            // directory (even a self-referencing one such as `glibc -> .`) is neither duplicated nor looped into.
+            copy_symlink(&current_source, &current_dest)?;
+        } else if current_source.is_dir() {
             if !current_dest.exists() {
                 fs::create_dir(&current_dest)?;
             }
@@ -138,9 +156,6 @@ fn copy_recursive(source: &Path, dest: &Path) -> io::Result<()> {
                     stack.push_back((next_source, next_dest));
                 }
             }
-        } else if current_source.is_symlink() {
-            // Follow symbolic links as regular files
-            fs::copy(current_source, current_dest)?;
         } else if current_source.is_file() {
             fs::copy(current_source, current_dest)?;
         }
@@ -154,8 +169,7 @@ fn copy_archive(source: &Path, dest: &Path) -> io::Result<()> {
     stack.push_back((source.to_path_buf(), dest.to_path_buf()));
     while let Some((current_source, current_dest)) = stack.pop_back() {
         if current_source.is_symlink() {
-            let target = current_source.read_link()?;
-            unix::fs::symlink(target, &current_dest)?;
+            copy_symlink(&current_source, &current_dest)?;
         } else if current_source.is_dir() {
             if !current_dest.exists() {
                 fs::create_dir(&current_dest)?;
@@ -351,8 +365,8 @@ mod tests {
             &test_base.join("foo/symlink1.txt"),
             &test_base.join("bar/symlink1.txt"),
         );
-        // recursive copy will treat symlink as a file
-        assert_recursive_same_link(
+        // recursive copy keeps symlinks as symlinks, like `cp -r`
+        assert_same_link(
             &test_base.join("foo/symlink1.txt"),
             &test_base.join("bar/symlink1.txt"),
         )
@@ -481,18 +495,6 @@ mod tests {
         assert_eq!(fs::read_link(source).unwrap(), fs::read_link(dest).unwrap());
     }
 
-    fn assert_recursive_same_link(source: &Path, dest: &Path) {
-        assert!(source.exists());
-        assert!(dest.exists());
-        assert!(source.is_symlink());
-        assert!(dest.is_file());
-
-        assert_eq!(
-            fs::read_to_string(source).unwrap(),
-            fs::read_to_string(dest).unwrap()
-        );
-    }
-
     #[test]
     fn injector_destination_picks_matching_arch() {
         let d = Path::new("/dst");
@@ -557,5 +559,57 @@ mod tests {
     #[test]
     fn archive_copy_installs_only_matching_injector() {
         injector_tree_test(CopyType::Archive);
+    }
+
+    fn symlink_tree_test(copy_type: CopyType) {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        fs::create_dir(src.path().join("linux-x64")).unwrap();
+        fs::write(src.path().join("linux-x64/native.so"), b"so").unwrap();
+        fs::write(src.path().join("sdk.py"), b"py").unwrap();
+        unix::fs::symlink(".", src.path().join("glibc")).unwrap();
+        unix::fs::symlink(".", src.path().join("musl")).unwrap();
+        unix::fs::symlink("linux-x64", src.path().join("linux")).unwrap();
+        unix::fs::symlink("does-not-exist", src.path().join("dangling")).unwrap();
+        let out = dst.path().join("out");
+        let copy = |t: CopyType| {
+            do_copy(CopyOperation {
+                source: src.path().to_path_buf(),
+                destination: out.clone(),
+                copy_type: t,
+            })
+        };
+        copy(copy_type).unwrap();
+        for (name, target) in [
+            ("glibc", "."),
+            ("musl", "."),
+            ("linux", "linux-x64"),
+            ("dangling", "does-not-exist"),
+        ] {
+            let p = out.join(name);
+            assert!(p.is_symlink(), "{name} must stay a symlink");
+            assert_eq!(fs::read_link(&p).unwrap(), PathBuf::from(target));
+        }
+        // the links resolve inside the copy, and nothing was duplicated through them
+        assert_eq!(fs::read(out.join("glibc/sdk.py")).unwrap(), b"py");
+        assert_eq!(fs::read(out.join("musl/linux/native.so")).unwrap(), b"so");
+        let entries = fs::read_dir(&out).unwrap().count();
+        assert_eq!(entries, 6);
+        // copying again into the filled destination (an init container that runs again) succeeds
+        copy(CopyType::Recursive).unwrap();
+        assert_eq!(
+            fs::read_link(out.join("glibc")).unwrap(),
+            PathBuf::from(".")
+        );
+    }
+
+    #[test]
+    fn recursive_copy_keeps_symlinks_without_following_them() {
+        symlink_tree_test(CopyType::Recursive);
+    }
+
+    #[test]
+    fn archive_copy_keeps_symlinks_without_following_them() {
+        symlink_tree_test(CopyType::Archive);
     }
 }
