@@ -104,19 +104,22 @@ every error ignored.
 Java and .NET follow the cause chain to the exception raised first (reflection and initializers wrap it);
 Python and Node use the exception that ended the process. The previous handler always runs afterwards.
 
-## SDK image layout (patch 0004)
+## SDK image layout
 
-The images keep today's `/autoinstrumentation` layout, so old-mode injection and older operators work unchanged and
-the copied size grows only by the injector (3.3 MiB): Python 26 MiB, Java 46, Node.js 66, .NET 117 (amd64).
-Upstream expects `<prefix>/<glibc|musl>/...`; patch 0004 makes the injector use an SDK laid out directly in `<prefix>`
-when there is no `<prefix>/<libc>` directory:
-- Python: `<prefix>/opentelemetry/instrumentation/auto_instrumentation/sitecustomize.py` present -> PYTHONPATH as the
-  operator sets it today, for glibc and musl alike (on Alpine the glibc native extensions fall back to pure Python, as
-  today).
-- .NET: `<prefix>/net/OpenTelemetry.AutoInstrumentation.StartupHook.dll` present -> `OTEL_DOTNET_AUTO_HOME=<prefix>`,
-  startup hook `<prefix>/net/...`, profiler `<prefix>/linux-<arch>/` or `<prefix>/linux-musl-<arch>/` chosen by the
-  detected libc (no runtime annotation needed). The guard's startup hook replaces OpenTelemetry's
-  (renamed `*.Original.dll`); the minimum .NET version (8) and the deps.json OpenTelemetry stand-down are upstream.
+The images keep today's `/autoinstrumentation` layout, so old-mode injection and older operators work unchanged, and
+add two self-referencing symlinks so the same files are also found at the paths upstream expects
+(`<prefix>/<glibc|musl>/...`), without patching the injector and without shipping the SDK twice:
+
+    /autoinstrumentation/glibc -> .
+    /autoinstrumentation/musl  -> .
+
+The images' `cp` (tools/cp-utility) copies symlinks as symlinks, so the links reach the pod's volume unchanged and
+are never followed (no loops, no duplicated files). With the links:
+- Python: `<prefix>/glibc` and `<prefix>/musl` are the SDK root; PYTHONPATH is built as in patch 0002. On Alpine the
+  glibc native extensions fall back to pure Python, as today.
+- .NET: `OTEL_DOTNET_AUTO_HOME=<prefix>/<libc>`, startup hook `<prefix>/<libc>/net/...`, profiler
+  `<prefix>/glibc/linux-<arch>/` or `<prefix>/musl/linux-musl-<arch>/` chosen by the detected libc (no runtime
+  annotation needed). The minimum .NET version (8) and the deps.json OpenTelemetry stand-down are upstream.
 - The guard's `sitecustomize.py` / startup hook / Java Premain wrapper are inert without our `LD_PRELOAD`.
 
 ## Logging (patch 0003)
@@ -130,7 +133,7 @@ skipped/restored`) are always printed.
 ## Python PYTHONPATH (patch 0002)
 
 `<sdk>/opentelemetry/instrumentation/auto_instrumentation : <original> : <sdk>`, the same order as the operator uses
-today, where `<sdk>` is `<prefix>/<libc>` if present, else `<prefix>` (patch 0004).
+today, where `<sdk>` is `<prefix>/<libc>` (a symlink to the SDK root in the ADOT images, see above).
 
 ## Architecture
 

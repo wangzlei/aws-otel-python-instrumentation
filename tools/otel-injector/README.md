@@ -30,7 +30,6 @@ Customers never use these files directly; they ship inside the SDK images.
 | `0001-startup-guard.patch` | The start-up guard (`src/adot_guard.zig`), with unit tests |
 | `0002-python-pythonpath.patch` | `PYTHONPATH` in the same order the Kubernetes operators use today |
 | `0003-quiet-unconfigured-runtimes.patch` | Debug-level logging for runtimes without an agent path and missing libc builds (the injector runs in every process) |
-| `0004-agent-in-prefix-layout.patch` | Python and .NET: use an SDK laid out directly in the agent path prefix (today's image layout) |
 
 The patches are kept in upstream style (one change each, with tests) so they can be proposed upstream.
 
